@@ -28,18 +28,21 @@ const (
 // Template 是可版本化、可复用的 Agent 能力声明。
 // Skills 的值归一化为 0~1，表示熟练度或匹配权重。
 type Template struct {
-	ID              uuid.UUID
-	Name            string
-	Role            string
-	Prompt          string
-	Model           string
-	Skills          map[string]float64
-	Tools           []string
-	Permissions     []string
-	TemplateVersion string
-	Enabled         bool
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID                    uuid.UUID
+	Name                  string
+	Role                  string
+	Prompt                string
+	Model                 string
+	Skills                map[string]float64
+	Tools                 []string
+	Permissions           []string
+	TemplateVersion       string
+	ContextWindow         int64
+	RiskZone              string
+	CostPer1KTokensMicros int64
+	Enabled               bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // Instance 是 Scheduler 实际可以 Reserve/Bind 的运行资源。

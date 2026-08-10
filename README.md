@@ -59,3 +59,6 @@ internal/server/        HTTP/gRPC 传输层
 
 详细设计见 [docs/architecture.md](docs/architecture.md)，阶段验收见 [docs/roadmap.md](docs/roadmap.md)。
 
+已完成的实现说明：
+
+- [阶段 2：Controller、Scheduler 与可靠事件](docs/phase-2-orchestration.md)

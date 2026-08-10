@@ -2,12 +2,16 @@
 
 ## 阶段 1：基础控制面
 
+状态：已完成（提交 `a4604ba`）。
+
 - 工程可以在 Go 1.24 编译；
 - 核心资源具有领域模型、状态机、PostgreSQL DDL 和仓储；
 - Kratos 同时提供 HTTP 与 gRPC API；
 - migration、单元测试和静态检查通过。
 
 ## 阶段 2：编排和调度
+
+状态：已完成实现与目标服务器验收，等待阶段提交。
 
 - 依赖完成后 Task 能从 BLOCKED 进入 READY；
 - Filter / Score 插件可独立测试；
@@ -27,4 +31,3 @@
 - Trace、Metrics、结构化日志可关联 swarm/task/attempt；
 - Docker Compose 可在目标 Ubuntu 服务器部署；
 - 端到端示例任务通过，回滚与运维步骤有文档。
-

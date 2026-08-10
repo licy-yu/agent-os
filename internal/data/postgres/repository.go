@@ -151,11 +151,12 @@ func (r *Repository) CreateTemplate(ctx context.Context, value *agent.Template) 
 		err = tx.QueryRow(ctx, `
 			INSERT INTO agent_templates (
 				id,name,role,prompt,model,skills,tools,permissions,template_version,
-				enabled,created_at,updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+				context_window,risk_zone,cost_per_1k_tokens_micros,enabled,created_at,updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 			RETURNING created_at,updated_at`,
 			value.ID, value.Name, value.Role, value.Prompt, value.Model, skills,
-			tools, permissions, value.TemplateVersion, value.Enabled, value.CreatedAt, value.UpdatedAt,
+			tools, permissions, value.TemplateVersion, value.ContextWindow, value.RiskZone,
+			value.CostPer1KTokensMicros, value.Enabled, value.CreatedAt, value.UpdatedAt,
 		).Scan(&value.CreatedAt, &value.UpdatedAt)
 		if err != nil {
 			return mapWriteError("创建 agent template", err)
@@ -169,7 +170,7 @@ func (r *Repository) CreateTemplate(ctx context.Context, value *agent.Template) 
 func (r *Repository) GetTemplate(ctx context.Context, id uuid.UUID) (*agent.Template, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT id,name,role,prompt,model,skills,tools,permissions,template_version,
-		       enabled,created_at,updated_at
+		       context_window,risk_zone,cost_per_1k_tokens_micros,enabled,created_at,updated_at
 		FROM agent_templates WHERE id=$1`, id)
 	value, err := scanTemplate(row)
 	if err != nil {
@@ -180,7 +181,7 @@ func (r *Repository) GetTemplate(ctx context.Context, id uuid.UUID) (*agent.Temp
 
 func (r *Repository) ListTemplates(ctx context.Context, page domain.Page) ([]*agent.Template, error) {
 	query := `SELECT id,name,role,prompt,model,skills,tools,permissions,template_version,
-	                 enabled,created_at,updated_at FROM agent_templates`
+	                 context_window,risk_zone,cost_per_1k_tokens_micros,enabled,created_at,updated_at FROM agent_templates`
 	args := make([]any, 0, 3)
 	if page.Cursor != nil {
 		query += ` WHERE (created_at,id) < ($1,$2)`
@@ -513,7 +514,8 @@ func scanTemplate(row rowScanner) (*agent.Template, error) {
 	value := new(agent.Template)
 	var skills, tools, permissions []byte
 	err := row.Scan(&value.ID, &value.Name, &value.Role, &value.Prompt, &value.Model,
-		&skills, &tools, &permissions, &value.TemplateVersion, &value.Enabled,
+		&skills, &tools, &permissions, &value.TemplateVersion, &value.ContextWindow,
+		&value.RiskZone, &value.CostPer1KTokensMicros, &value.Enabled,
 		&value.CreatedAt, &value.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -542,12 +544,19 @@ func scanInstance(row rowScanner) (*agent.Instance, error) {
 }
 
 func scanTask(row rowScanner) (*task.Task, error) {
+	return scanTaskExtra(row)
+}
+
+// scanTaskExtra 允许调度查询在标准 Task 列后追加 QueueScore 所需的聚合列。
+func scanTaskExtra(row rowScanner, extra ...any) (*task.Task, error) {
 	value := new(task.Task)
 	var input, requirements, acceptance, policy []byte
-	err := row.Scan(&value.ID, &value.SwarmID, &value.ParentID, &value.Name, &value.Goal,
+	destinations := []any{&value.ID, &value.SwarmID, &value.ParentID, &value.Name, &value.Goal,
 		&value.Status, &value.Priority, &input, &requirements, &acceptance, &policy,
 		&value.AssignedAgentID, &value.AttemptCount, &value.AvailableAt, &value.Deadline,
-		&value.Version, &value.CreatedAt, &value.UpdatedAt)
+		&value.Version, &value.CreatedAt, &value.UpdatedAt}
+	destinations = append(destinations, extra...)
+	err := row.Scan(destinations...)
 	if err != nil {
 		return nil, err
 	}

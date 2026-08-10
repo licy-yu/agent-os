@@ -16,6 +16,7 @@ import (
 )
 
 // migrations 在编译时进入二进制，因此生产容器不依赖外部 SQL 文件路径。
+//
 //go:embed sql/*.sql
 var migrations embed.FS
 
@@ -94,4 +95,3 @@ func applyOne(ctx context.Context, conn *pgx.Conn, name string) error {
 	}
 	return nil
 }
-

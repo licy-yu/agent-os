@@ -9,8 +9,13 @@ import (
 
 	"github.com/go-kratos/kratos/v2"
 	"github.com/go-kratos/kratos/v2/log"
+	"github.com/google/uuid"
 	"github.com/licy-yu/agent-os/internal/conf"
 	"github.com/licy-yu/agent-os/internal/data/postgres"
+	"github.com/licy-yu/agent-os/internal/event"
+	"github.com/licy-yu/agent-os/internal/infrastructure/natsevent"
+	"github.com/licy-yu/agent-os/internal/infrastructure/redislease"
+	"github.com/licy-yu/agent-os/internal/orchestrator"
 	"github.com/licy-yu/agent-os/internal/server"
 	"github.com/licy-yu/agent-os/internal/service"
 )
@@ -47,10 +52,28 @@ func main() {
 	if err := repository.Migrate(initCtx); err != nil {
 		log.NewHelper(logger).Fatalf("执行数据库迁移失败: %v", err)
 	}
+	leaseManager, err := redislease.New(initCtx, cfg.Data.RedisAddr, cfg.Data.RedisPassword)
+	if err != nil {
+		log.NewHelper(logger).Fatalf("初始化 Redis Lease 失败: %v", err)
+	}
+	defer func() { _ = leaseManager.Close() }()
+	eventBus, err := natsevent.New(initCtx, cfg.Data.NATSURL)
+	if err != nil {
+		log.NewHelper(logger).Fatalf("初始化 NATS JetStream 失败: %v", err)
+	}
+	defer func() { _ = eventBus.Close() }()
 
 	svc := service.NewControlPlaneService(repository, repository, repository, repository)
 	httpServer := server.NewHTTPServer(cfg.Server, svc, logger)
 	grpcServer := server.NewGRPCServer(cfg.Server, svc, logger)
+	taskController := orchestrator.NewTaskController(repository, logger)
+	agentController := orchestrator.NewAgentController(repository)
+	scheduler := orchestrator.NewScheduler(repository, leaseManager, cfg.Runtime.LeaseTTL, logger)
+	dispatcher := event.NewDispatcher(repository, eventBus, hostname()+"-"+uuid.NewString(), cfg.Runtime.OutboxInterval, logger)
+	orchestratorRuntime := orchestrator.NewRuntime(
+		taskController, agentController, scheduler, dispatcher,
+		cfg.Runtime.ReconcileInterval, logger,
+	)
 
 	app := kratos.New(
 		kratos.ID(hostname()),
@@ -58,7 +81,7 @@ func main() {
 		kratos.Version(buildVersion),
 		kratos.Metadata(map[string]string{"environment": cfg.Server.Environment, "commit": buildCommit}),
 		kratos.Logger(logger),
-		kratos.Server(httpServer, grpcServer),
+		kratos.Server(httpServer, grpcServer, orchestratorRuntime),
 		kratos.StopTimeout(cfg.Server.ShutdownTimeout),
 	)
 	if err := app.Run(); err != nil {

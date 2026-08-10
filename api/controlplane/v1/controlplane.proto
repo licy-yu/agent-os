@@ -83,6 +83,9 @@ message AgentTemplate {
   bool enabled = 10;
   google.protobuf.Timestamp created_at = 11;
   google.protobuf.Timestamp updated_at = 12;
+  int64 context_window = 13;
+  string risk_zone = 14;
+  int64 cost_per_1k_tokens_micros = 15;
 }
 
 message CreateAgentTemplateRequest {
@@ -94,6 +97,9 @@ message CreateAgentTemplateRequest {
   repeated string tools = 6;
   repeated string permissions = 7;
   string template_version = 8;
+  int64 context_window = 9;
+  string risk_zone = 10;
+  int64 cost_per_1k_tokens_micros = 11;
 }
 
 message ListAgentTemplatesRequest { PageRequest page = 1; }
@@ -177,4 +183,3 @@ message ListTasksReply {
   repeated Task items = 1;
   string next_page_token = 2;
 }
-

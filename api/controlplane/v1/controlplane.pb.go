@@ -485,21 +485,24 @@ func (x *ListSwarmsReply) GetNextPageToken() string {
 }
 
 type AgentTemplate struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Id              string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Name            string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Role            string                 `protobuf:"bytes,3,opt,name=role,proto3" json:"role,omitempty"`
-	Prompt          string                 `protobuf:"bytes,4,opt,name=prompt,proto3" json:"prompt,omitempty"`
-	Model           string                 `protobuf:"bytes,5,opt,name=model,proto3" json:"model,omitempty"`
-	Skills          map[string]float64     `protobuf:"bytes,6,rep,name=skills,proto3" json:"skills,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
-	Tools           []string               `protobuf:"bytes,7,rep,name=tools,proto3" json:"tools,omitempty"`
-	Permissions     []string               `protobuf:"bytes,8,rep,name=permissions,proto3" json:"permissions,omitempty"`
-	TemplateVersion string                 `protobuf:"bytes,9,opt,name=template_version,json=templateVersion,proto3" json:"template_version,omitempty"`
-	Enabled         bool                   `protobuf:"varint,10,opt,name=enabled,proto3" json:"enabled,omitempty"`
-	CreatedAt       *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	UpdatedAt       *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	Id                     string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Name                   string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Role                   string                 `protobuf:"bytes,3,opt,name=role,proto3" json:"role,omitempty"`
+	Prompt                 string                 `protobuf:"bytes,4,opt,name=prompt,proto3" json:"prompt,omitempty"`
+	Model                  string                 `protobuf:"bytes,5,opt,name=model,proto3" json:"model,omitempty"`
+	Skills                 map[string]float64     `protobuf:"bytes,6,rep,name=skills,proto3" json:"skills,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
+	Tools                  []string               `protobuf:"bytes,7,rep,name=tools,proto3" json:"tools,omitempty"`
+	Permissions            []string               `protobuf:"bytes,8,rep,name=permissions,proto3" json:"permissions,omitempty"`
+	TemplateVersion        string                 `protobuf:"bytes,9,opt,name=template_version,json=templateVersion,proto3" json:"template_version,omitempty"`
+	Enabled                bool                   `protobuf:"varint,10,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	CreatedAt              *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	UpdatedAt              *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	ContextWindow          int64                  `protobuf:"varint,13,opt,name=context_window,json=contextWindow,proto3" json:"context_window,omitempty"`
+	RiskZone               string                 `protobuf:"bytes,14,opt,name=risk_zone,json=riskZone,proto3" json:"risk_zone,omitempty"`
+	CostPer_1KTokensMicros int64                  `protobuf:"varint,15,opt,name=cost_per_1k_tokens_micros,json=costPer1kTokensMicros,proto3" json:"cost_per_1k_tokens_micros,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *AgentTemplate) Reset() {
@@ -616,18 +619,42 @@ func (x *AgentTemplate) GetUpdatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *AgentTemplate) GetContextWindow() int64 {
+	if x != nil {
+		return x.ContextWindow
+	}
+	return 0
+}
+
+func (x *AgentTemplate) GetRiskZone() string {
+	if x != nil {
+		return x.RiskZone
+	}
+	return ""
+}
+
+func (x *AgentTemplate) GetCostPer_1KTokensMicros() int64 {
+	if x != nil {
+		return x.CostPer_1KTokensMicros
+	}
+	return 0
+}
+
 type CreateAgentTemplateRequest struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Name            string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Role            string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
-	Prompt          string                 `protobuf:"bytes,3,opt,name=prompt,proto3" json:"prompt,omitempty"`
-	Model           string                 `protobuf:"bytes,4,opt,name=model,proto3" json:"model,omitempty"`
-	Skills          map[string]float64     `protobuf:"bytes,5,rep,name=skills,proto3" json:"skills,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
-	Tools           []string               `protobuf:"bytes,6,rep,name=tools,proto3" json:"tools,omitempty"`
-	Permissions     []string               `protobuf:"bytes,7,rep,name=permissions,proto3" json:"permissions,omitempty"`
-	TemplateVersion string                 `protobuf:"bytes,8,opt,name=template_version,json=templateVersion,proto3" json:"template_version,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	Name                   string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Role                   string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+	Prompt                 string                 `protobuf:"bytes,3,opt,name=prompt,proto3" json:"prompt,omitempty"`
+	Model                  string                 `protobuf:"bytes,4,opt,name=model,proto3" json:"model,omitempty"`
+	Skills                 map[string]float64     `protobuf:"bytes,5,rep,name=skills,proto3" json:"skills,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
+	Tools                  []string               `protobuf:"bytes,6,rep,name=tools,proto3" json:"tools,omitempty"`
+	Permissions            []string               `protobuf:"bytes,7,rep,name=permissions,proto3" json:"permissions,omitempty"`
+	TemplateVersion        string                 `protobuf:"bytes,8,opt,name=template_version,json=templateVersion,proto3" json:"template_version,omitempty"`
+	ContextWindow          int64                  `protobuf:"varint,9,opt,name=context_window,json=contextWindow,proto3" json:"context_window,omitempty"`
+	RiskZone               string                 `protobuf:"bytes,10,opt,name=risk_zone,json=riskZone,proto3" json:"risk_zone,omitempty"`
+	CostPer_1KTokensMicros int64                  `protobuf:"varint,11,opt,name=cost_per_1k_tokens_micros,json=costPer1kTokensMicros,proto3" json:"cost_per_1k_tokens_micros,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *CreateAgentTemplateRequest) Reset() {
@@ -714,6 +741,27 @@ func (x *CreateAgentTemplateRequest) GetTemplateVersion() string {
 		return x.TemplateVersion
 	}
 	return ""
+}
+
+func (x *CreateAgentTemplateRequest) GetContextWindow() int64 {
+	if x != nil {
+		return x.ContextWindow
+	}
+	return 0
+}
+
+func (x *CreateAgentTemplateRequest) GetRiskZone() string {
+	if x != nil {
+		return x.RiskZone
+	}
+	return ""
+}
+
+func (x *CreateAgentTemplateRequest) GetCostPer_1KTokensMicros() int64 {
+	if x != nil {
+		return x.CostPer_1KTokensMicros
+	}
+	return 0
 }
 
 type ListAgentTemplatesRequest struct {
@@ -1579,7 +1627,7 @@ const file_controlplane_v1_controlplane_proto_rawDesc = "" +
 	"\x04page\x18\x01 \x01(\v2$.swarmos.controlplane.v1.PageRequestR\x04page\"o\n" +
 	"\x0fListSwarmsReply\x124\n" +
 	"\x05items\x18\x01 \x03(\v2\x1e.swarmos.controlplane.v1.SwarmR\x05items\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xef\x03\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xed\x04\n" +
 	"\rAgentTemplate\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -1595,10 +1643,13 @@ const file_controlplane_v1_controlplane_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
-	"updated_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x1a9\n" +
+	"updated_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12%\n" +
+	"\x0econtext_window\x18\r \x01(\x03R\rcontextWindow\x12\x1b\n" +
+	"\trisk_zone\x18\x0e \x01(\tR\briskZone\x128\n" +
+	"\x19cost_per_1k_tokens_micros\x18\x0f \x01(\x03R\x15costPer1kTokensMicros\x1a9\n" +
 	"\vSkillsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\"\xe9\x02\n" +
+	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\"\xe7\x03\n" +
 	"\x1aCreateAgentTemplateRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x16\n" +
@@ -1607,7 +1658,11 @@ const file_controlplane_v1_controlplane_proto_rawDesc = "" +
 	"\x06skills\x18\x05 \x03(\v2?.swarmos.controlplane.v1.CreateAgentTemplateRequest.SkillsEntryR\x06skills\x12\x14\n" +
 	"\x05tools\x18\x06 \x03(\tR\x05tools\x12 \n" +
 	"\vpermissions\x18\a \x03(\tR\vpermissions\x12)\n" +
-	"\x10template_version\x18\b \x01(\tR\x0ftemplateVersion\x1a9\n" +
+	"\x10template_version\x18\b \x01(\tR\x0ftemplateVersion\x12%\n" +
+	"\x0econtext_window\x18\t \x01(\x03R\rcontextWindow\x12\x1b\n" +
+	"\trisk_zone\x18\n" +
+	" \x01(\tR\briskZone\x128\n" +
+	"\x19cost_per_1k_tokens_micros\x18\v \x01(\x03R\x15costPer1kTokensMicros\x1a9\n" +
 	"\vSkillsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\"U\n" +

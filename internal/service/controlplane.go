@@ -140,6 +140,13 @@ func (s *ControlPlaneService) CreateAgentTemplate(ctx context.Context, req *v1.C
 			return nil, kratosErrors.BadRequest("INVALID_SKILL", "skill 名不能为空且熟练度必须在 0~1 之间")
 		}
 	}
+	if req.GetContextWindow() < 0 || req.GetCostPer_1KTokensMicros() < 0 {
+		return nil, kratosErrors.BadRequest("INVALID_CAPACITY", "context_window 和 cost_per_1k_tokens_micros 不能为负数")
+	}
+	riskZone := strings.TrimSpace(req.GetRiskZone())
+	if riskZone == "" {
+		riskZone = "sandbox"
+	}
 	templateVersion := strings.TrimSpace(req.TemplateVersion)
 	if templateVersion == "" {
 		templateVersion = "1.0.0"
@@ -149,7 +156,8 @@ func (s *ControlPlaneService) CreateAgentTemplate(ctx context.Context, req *v1.C
 		ID: uuid.New(), Name: strings.TrimSpace(req.Name), Role: strings.TrimSpace(req.Role),
 		Prompt: req.Prompt, Model: strings.TrimSpace(req.Model), Skills: cloneSkills(req.Skills),
 		Tools: cleanStrings(req.Tools), Permissions: cleanStrings(req.Permissions),
-		TemplateVersion: templateVersion, Enabled: true, CreatedAt: now, UpdatedAt: now,
+		TemplateVersion: templateVersion, ContextWindow: req.GetContextWindow(), RiskZone: riskZone,
+		CostPer1KTokensMicros: req.GetCostPer_1KTokensMicros(), Enabled: true, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := s.agents.CreateTemplate(ctx, value); err != nil {
 		return nil, translateError(err)
@@ -557,7 +565,9 @@ func templateToProto(value *agent.Template) *v1.AgentTemplate {
 		Id: value.ID.String(), Name: value.Name, Role: value.Role, Prompt: value.Prompt,
 		Model: value.Model, Skills: cloneSkills(value.Skills), Tools: append([]string(nil), value.Tools...),
 		Permissions: append([]string(nil), value.Permissions...), TemplateVersion: value.TemplateVersion,
-		Enabled: value.Enabled, CreatedAt: timestamppb.New(value.CreatedAt), UpdatedAt: timestamppb.New(value.UpdatedAt),
+		ContextWindow: value.ContextWindow, RiskZone: value.RiskZone,
+		CostPer_1KTokensMicros: value.CostPer1KTokensMicros, Enabled: value.Enabled,
+		CreatedAt: timestamppb.New(value.CreatedAt), UpdatedAt: timestamppb.New(value.UpdatedAt),
 	}
 }
 
