@@ -69,9 +69,11 @@ func main() {
 	taskController := orchestrator.NewTaskController(repository, logger)
 	agentController := orchestrator.NewAgentController(repository)
 	scheduler := orchestrator.NewScheduler(repository, leaseManager, cfg.Runtime.LeaseTTL, logger)
+	reviewer := orchestrator.NewReviewerController(repository)
+	recovery := orchestrator.NewRecoveryController(repository, cfg.Runtime.HeartbeatTimeout)
 	dispatcher := event.NewDispatcher(repository, eventBus, hostname()+"-"+uuid.NewString(), cfg.Runtime.OutboxInterval, logger)
 	orchestratorRuntime := orchestrator.NewRuntime(
-		taskController, agentController, scheduler, dispatcher,
+		taskController, agentController, scheduler, reviewer, recovery, dispatcher,
 		cfg.Runtime.ReconcileInterval, logger,
 	)
 

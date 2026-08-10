@@ -18,3 +18,9 @@ runtime:
   reconcile_interval: 5s
   outbox_interval: 1s
 
+worker:
+  # 多个 Worker 使用同一个 Durable 名称，JetStream 会把任务在进程间均衡分配。
+  durable: swarmos-workers
+  concurrency: 4
+  heartbeat_interval: 10s
+  ack_wait: 30s

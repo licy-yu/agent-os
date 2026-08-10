@@ -15,6 +15,8 @@ type Runtime struct {
 	tasks      *TaskController
 	agents     *AgentController
 	scheduler  *Scheduler
+	reviewer   *ReviewerController
+	recovery   *RecoveryController
 	dispatcher *event.Dispatcher
 	interval   time.Duration
 	logger     *log.Helper
@@ -24,9 +26,13 @@ type Runtime struct {
 	done   chan struct{}
 }
 
-func NewRuntime(tasks *TaskController, agents *AgentController, scheduler *Scheduler, dispatcher *event.Dispatcher, interval time.Duration, logger log.Logger) *Runtime {
+func NewRuntime(tasks *TaskController, agents *AgentController, scheduler *Scheduler,
+	reviewer *ReviewerController, recovery *RecoveryController, dispatcher *event.Dispatcher,
+	interval time.Duration, logger log.Logger,
+) *Runtime {
 	return &Runtime{
-		tasks: tasks, agents: agents, scheduler: scheduler, dispatcher: dispatcher,
+		tasks: tasks, agents: agents, scheduler: scheduler, reviewer: reviewer,
+		recovery: recovery, dispatcher: dispatcher,
 		interval: interval, logger: log.NewHelper(log.With(logger, "component", "orchestrator-runtime")),
 	}
 }
@@ -42,7 +48,7 @@ func (r *Runtime) Start(parent context.Context) error {
 	r.mu.Unlock()
 
 	var workers sync.WaitGroup
-	workers.Add(4)
+	workers.Add(6)
 	go func() {
 		defer workers.Done()
 		r.runTaskController(ctx)
@@ -57,6 +63,14 @@ func (r *Runtime) Start(parent context.Context) error {
 	}()
 	go func() {
 		defer workers.Done()
+		r.runReviewer(ctx)
+	}()
+	go func() {
+		defer workers.Done()
+		r.runRecovery(ctx)
+	}()
+	go func() {
+		defer workers.Done()
 		r.dispatcher.Run(ctx)
 	}()
 
@@ -64,6 +78,20 @@ func (r *Runtime) Start(parent context.Context) error {
 	workers.Wait()
 	close(done)
 	return nil
+}
+
+func (r *Runtime) runReviewer(ctx context.Context) {
+	r.runPeriodic(ctx, r.interval, func() (bool, error) {
+		changed, err := r.reviewer.ReconcileOnce(ctx)
+		return changed > 0, err
+	}, "ReviewerController")
+}
+
+func (r *Runtime) runRecovery(ctx context.Context) {
+	r.runPeriodic(ctx, r.interval, func() (bool, error) {
+		changed, err := r.recovery.ReconcileOnce(ctx)
+		return changed > 0, err
+	}, "RecoveryController")
 }
 
 // Stop 请求后台循环退出并尊重 Kratos 的停止超时。

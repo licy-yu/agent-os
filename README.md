@@ -26,11 +26,12 @@ A2A、AgentSet 自动扩缩和自动进化属于 V2/V3，不会混进 V1 的核�
 
 选择 Kratos v2 而不是 v3 的原因是：v3.0.0 要求 Go 1.25，而目标运行服务器固定为 Go 1.24.13。项目优先保证本地、CI 和部署环境可复现。
 
-## 本地启动（阶段 1）
+## 本地启动
 
 ```bash
 docker compose up -d postgres redis nats
 go run ./cmd/control-plane -config ./configs/config.yaml
+go run ./cmd/worker -config ./configs/config.yaml
 ```
 
 健康检查：
@@ -51,6 +52,9 @@ internal/domain/        领域实体、状态机和仓储接口
 internal/data/          PostgreSQL 等基础设施实现
 internal/service/       Kratos API 用例编排
 internal/server/        HTTP/gRPC 传输层
+internal/worker/        Agent 执行循环与模型适配
+internal/toolgateway/   工具权限、额度、审计和 MCP 适配
+internal/execution/     Attempt/Checkpoint/Evaluation 执行合同
 ```
 
 ## 安全约束
@@ -62,3 +66,4 @@ internal/server/        HTTP/gRPC 传输层
 已完成的实现说明：
 
 - [阶段 2：Controller、Scheduler 与可靠事件](docs/phase-2-orchestration.md)
+- [阶段 3：Worker、工具治理、审查与恢复](docs/phase-3-execution.md)

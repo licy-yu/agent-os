@@ -11,7 +11,7 @@
 
 ## 阶段 2：编排和调度
 
-状态：已完成实现与目标服务器验收，等待阶段提交。
+状态：已完成（提交 `537b121`），并通过目标服务器验收。
 
 - 依赖完成后 Task 能从 BLOCKED 进入 READY；
 - Filter / Score 插件可独立测试；
@@ -19,6 +19,8 @@
 - Transactional Outbox 能可靠投递 JetStream。
 
 ## 阶段 3：执行和可靠性
+
+状态：已完成实现与目标服务器验收。
 
 - Worker 创建 Attempt 并按步骤保存 Checkpoint；
 - Tool Gateway 执行权限、风险、预算、限流和审计；

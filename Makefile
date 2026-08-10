@@ -1,4 +1,4 @@
-.PHONY: proto fmt test test-race build run infra-up infra-down
+.PHONY: proto fmt test test-race build run run-worker infra-up infra-down
 
 # 生成 protobuf 与 gRPC 代码。生成结果提交到仓库，部署机无需安装 protoc。
 proto:
@@ -17,13 +17,16 @@ test-race:
 
 build:
 	go build -trimpath -o bin/control-plane ./cmd/control-plane
+	go build -trimpath -o bin/worker ./cmd/worker
 
 run:
 	go run ./cmd/control-plane -config ./configs/config.yaml
+
+run-worker:
+	go run ./cmd/worker -config ./configs/config.yaml
 
 infra-up:
 	docker compose up -d --wait postgres redis nats
 
 infra-down:
 	docker compose down
-

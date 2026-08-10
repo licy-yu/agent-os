@@ -3,9 +3,11 @@ package natsevent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/licy-yu/agent-os/internal/assignment"
 	"github.com/licy-yu/agent-os/internal/event"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -17,6 +19,50 @@ const streamName = "SWARM_EVENTS"
 type Bus struct {
 	connection *nats.Conn
 	jetStream  jetstream.JetStream
+}
+
+// TaskAssignmentSource 是 Worker 对 task.assigned 的持久消费者。
+// Durable 名称固定后，Worker 重启会从上次 ACK 的位置继续，而不是跳过停机期间的任务。
+type TaskAssignmentSource struct {
+	consumer jetstream.Consumer
+}
+
+// AssignmentMessage 包装 JetStream 消息，Worker 只依赖 ACK/NAK 合同而不依赖 NATS 类型。
+type AssignmentMessage struct{ message jetstream.Msg }
+
+func (m *AssignmentMessage) Data() []byte { return m.message.Data() }
+func (m *AssignmentMessage) Ack(ctx context.Context) error {
+	return m.message.DoubleAck(ctx)
+}
+func (m *AssignmentMessage) Retry(delay time.Duration) error { return m.message.NakWithDelay(delay) }
+func (m *AssignmentMessage) InProgress() error               { return m.message.InProgress() }
+
+// NewTaskAssignmentSource 声明显式 ACK 的 Pull Consumer。
+// AckWait 大于单次心跳周期；长任务会通过 InProgress 延长服务端 ACK 计时。
+func (b *Bus) NewTaskAssignmentSource(ctx context.Context, durable string, ackWait time.Duration) (*TaskAssignmentSource, error) {
+	consumer, err := b.jetStream.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		Name: durable, Durable: durable, Description: "SwarmOS Worker 任务分配消费者",
+		DeliverPolicy: jetstream.DeliverAllPolicy, AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: ackWait, MaxDeliver: 20, FilterSubject: "task.assigned",
+		BackOff: []time.Duration{time.Second, 5 * time.Second, 15 * time.Second, time.Minute},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("声明 task.assigned consumer %s: %w", durable, err)
+	}
+	return &TaskAssignmentSource{consumer: consumer}, nil
+}
+
+// Next 最多等待 1 秒，使 Kratos Stop 不必等待长时间阻塞的拉取请求。
+// 超时不是错误，以 (nil,nil) 通知 Worker 再检查一次退出上下文。
+func (s *TaskAssignmentSource) Next(_ context.Context) (assignment.Message, error) {
+	message, err := s.consumer.Next(jetstream.FetchMaxWait(time.Second))
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoMessages) || errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("拉取 task.assigned: %w", err)
+	}
+	return &AssignmentMessage{message: message}, nil
 }
 
 // New 建立连接并声明事件流。CreateOrUpdateStream 使启动过程可重复执行。

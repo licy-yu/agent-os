@@ -19,6 +19,15 @@ type Config struct {
 	Server  ServerConfig  `yaml:"server"`
 	Data    DataConfig    `yaml:"data"`
 	Runtime RuntimeConfig `yaml:"runtime"`
+	Worker  WorkerConfig  `yaml:"worker"`
+}
+
+// WorkerConfig 控制独立执行进程的 Durable Consumer、并发和双层心跳。
+type WorkerConfig struct {
+	Durable           string        `yaml:"durable"`
+	Concurrency       int           `yaml:"concurrency"`
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
+	AckWait           time.Duration `yaml:"ack_wait"`
 }
 
 // ServerConfig 描述 Kratos HTTP/gRPC 监听参数。
@@ -54,7 +63,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("读取配置文件 %q: %w", path, err)
 	}
 
-	var cfg Config
+	// 新增配置项提供保守默认值，旧版部署文件升级二进制时无需一次性补齐非敏感字段。
+	cfg := Config{Worker: WorkerConfig{
+		Durable: "swarmos-workers", Concurrency: 4,
+		HeartbeatInterval: 10 * time.Second, AckWait: 30 * time.Second,
+	}}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件 %q: %w", path, err)
 	}
@@ -83,6 +96,24 @@ func applyEnvironment(cfg *Config) {
 	overrideDuration("SWARMOS_LEASE_TTL", &cfg.Runtime.LeaseTTL)
 	overrideDuration("SWARMOS_RECONCILE_INTERVAL", &cfg.Runtime.ReconcileInterval)
 	overrideDuration("SWARMOS_OUTBOX_INTERVAL", &cfg.Runtime.OutboxInterval)
+
+	overrideString("SWARMOS_WORKER_DURABLE", &cfg.Worker.Durable)
+	overrideInt("SWARMOS_WORKER_CONCURRENCY", &cfg.Worker.Concurrency)
+	overrideDuration("SWARMOS_WORKER_HEARTBEAT_INTERVAL", &cfg.Worker.HeartbeatInterval)
+	overrideDuration("SWARMOS_WORKER_ACK_WAIT", &cfg.Worker.AckWait)
+}
+
+func overrideInt(name string, target *int) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		*target = -1
+		return
+	}
+	*target = parsed
 }
 
 func overrideString(name string, target *string) {
@@ -126,6 +157,14 @@ func (c Config) Validate() error {
 		return errors.New("runtime.reconcile_interval 必须是正时长")
 	case c.Runtime.OutboxInterval <= 0:
 		return errors.New("runtime.outbox_interval 必须是正时长")
+	case c.Worker.Durable == "":
+		return errors.New("worker.durable 不能为空")
+	case c.Worker.Concurrency <= 0:
+		return errors.New("worker.concurrency 必须为正整数")
+	case c.Worker.HeartbeatInterval <= 0:
+		return errors.New("worker.heartbeat_interval 必须是正时长")
+	case c.Worker.AckWait <= c.Worker.HeartbeatInterval:
+		return errors.New("worker.ack_wait 必须大于 heartbeat_interval")
 	}
 	return nil
 }
