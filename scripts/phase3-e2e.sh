@@ -5,22 +5,33 @@ set -euo pipefail
 
 project_dir="${SWARMOS_PROJECT_DIR:-/srv/projects/agent-os}"
 base_url="${SWARMOS_E2E_BASE_URL:-http://127.0.0.1:8080}"
+managed_runtime="${SWARMOS_E2E_MANAGED_RUNTIME:-false}"
 cd "$project_dir"
 
 control_log=/tmp/swarmos-phase3-control.log
 worker_log=/tmp/swarmos-phase3-worker.log
 : >"$control_log"
 : >"$worker_log"
-./bin/control-plane -config ./configs/config.yaml >"$control_log" 2>&1 &
-control_pid=$!
+control_pid=""
 worker_pid=""
 
+# 默认模式适合空闲验收机：脚本自己启动并清理进程。生产模式复用 Compose/systemd
+# 已托管的控制面和 Worker，避免端口冲突，也能验证真正长期运行的发布实例。
+if [[ "${managed_runtime}" != "true" ]]; then
+  ./bin/control-plane -config ./configs/config.yaml >"$control_log" 2>&1 &
+  control_pid=$!
+fi
+
 cleanup() {
-  kill "$control_pid" 2>/dev/null || true
+  if [[ -n "$control_pid" ]]; then
+    kill "$control_pid" 2>/dev/null || true
+  fi
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
   fi
-  wait "$control_pid" 2>/dev/null || true
+  if [[ -n "$control_pid" ]]; then
+    wait "$control_pid" 2>/dev/null || true
+  fi
   if [[ -n "$worker_pid" ]]; then
     wait "$worker_pid" 2>/dev/null || true
   fi
@@ -35,8 +46,10 @@ for _ in $(seq 1 30); do
 done
 curl -fsS "$base_url/healthz" >/dev/null
 
-./bin/worker -config ./configs/config.yaml >"$worker_log" 2>&1 &
-worker_pid=$!
+if [[ "${managed_runtime}" != "true" ]]; then
+  ./bin/worker -config ./configs/config.yaml >"$worker_log" 2>&1 &
+  worker_pid=$!
+fi
 
 post() {
   local path=$1
