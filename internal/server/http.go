@@ -52,86 +52,86 @@ func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, cons
 		"/swarmos.controlplane.v1.ControlPlane/CreateSwarm",
 		unaryBody(http.StatusCreated, svc.CreateSwarm),
 	))
-	route.GET("/swarms", withOperation("/swarmos.controlplane.v1.ControlPlane/ListSwarms", func(ctx khttp.Context) error {
+	route.GET("/swarms", withOperation("/swarmos.controlplane.v1.ControlPlane/ListSwarms", func(ctx khttp.Context, callCtx context.Context) error {
 		page, err := pageFromQuery(ctx)
 		if err != nil {
 			return err
 		}
-		return ctx.Returns(svc.ListSwarms(ctx, &v1.ListSwarmsRequest{Page: page}))
+		return ctx.Returns(svc.ListSwarms(callCtx, &v1.ListSwarmsRequest{Page: page}))
 	}))
-	route.GET("/swarms/{id}", withOperation("/swarmos.controlplane.v1.ControlPlane/GetSwarm", func(ctx khttp.Context) error {
-		return ctx.Returns(svc.GetSwarm(ctx, &v1.GetSwarmRequest{Id: ctx.Vars().Get("id")}))
+	route.GET("/swarms/{id}", withOperation("/swarmos.controlplane.v1.ControlPlane/GetSwarm", func(ctx khttp.Context, callCtx context.Context) error {
+		return ctx.Returns(svc.GetSwarm(callCtx, &v1.GetSwarmRequest{Id: ctx.Vars().Get("id")}))
 	}))
 
 	route.POST("/agent-templates", withOperation(
 		"/swarmos.controlplane.v1.ControlPlane/CreateAgentTemplate",
 		unaryBody(http.StatusCreated, svc.CreateAgentTemplate),
 	))
-	route.GET("/agent-templates", withOperation("/swarmos.controlplane.v1.ControlPlane/ListAgentTemplates", func(ctx khttp.Context) error {
+	route.GET("/agent-templates", withOperation("/swarmos.controlplane.v1.ControlPlane/ListAgentTemplates", func(ctx khttp.Context, callCtx context.Context) error {
 		page, err := pageFromQuery(ctx)
 		if err != nil {
 			return err
 		}
-		return ctx.Returns(svc.ListAgentTemplates(ctx, &v1.ListAgentTemplatesRequest{Page: page}))
+		return ctx.Returns(svc.ListAgentTemplates(callCtx, &v1.ListAgentTemplatesRequest{Page: page}))
 	}))
 	route.POST("/agents", withOperation(
 		"/swarmos.controlplane.v1.ControlPlane/RegisterAgent",
 		unaryBody(http.StatusCreated, svc.RegisterAgent),
 	))
-	route.GET("/agents", withOperation("/swarmos.controlplane.v1.ControlPlane/ListAgents", func(ctx khttp.Context) error {
+	route.GET("/agents", withOperation("/swarmos.controlplane.v1.ControlPlane/ListAgents", func(ctx khttp.Context, callCtx context.Context) error {
 		page, err := pageFromQuery(ctx)
 		if err != nil {
 			return err
 		}
-		return ctx.Returns(svc.ListAgents(ctx, &v1.ListAgentsRequest{SwarmId: ctx.Query().Get("swarm_id"), Page: page}))
+		return ctx.Returns(svc.ListAgents(callCtx, &v1.ListAgentsRequest{SwarmId: ctx.Query().Get("swarm_id"), Page: page}))
 	}))
 
 	route.POST("/tasks", withOperation(
 		"/swarmos.controlplane.v1.ControlPlane/CreateTask",
 		unaryBody(http.StatusCreated, svc.CreateTask),
 	))
-	route.GET("/tasks", withOperation("/swarmos.controlplane.v1.ControlPlane/ListTasks", func(ctx khttp.Context) error {
+	route.GET("/tasks", withOperation("/swarmos.controlplane.v1.ControlPlane/ListTasks", func(ctx khttp.Context, callCtx context.Context) error {
 		page, err := pageFromQuery(ctx)
 		if err != nil {
 			return err
 		}
-		return ctx.Returns(svc.ListTasks(ctx, &v1.ListTasksRequest{
+		return ctx.Returns(svc.ListTasks(callCtx, &v1.ListTasksRequest{
 			SwarmId: ctx.Query().Get("swarm_id"), Status: ctx.Query().Get("status"), Page: page,
 		}))
 	}))
-	route.GET("/tasks/{id}", withOperation("/swarmos.controlplane.v1.ControlPlane/GetTask", func(ctx khttp.Context) error {
-		return ctx.Returns(svc.GetTask(ctx, &v1.GetTaskRequest{Id: ctx.Vars().Get("id")}))
+	route.GET("/tasks/{id}", withOperation("/swarmos.controlplane.v1.ControlPlane/GetTask", func(ctx khttp.Context, callCtx context.Context) error {
+		return ctx.Returns(svc.GetTask(callCtx, &v1.GetTaskRequest{Id: ctx.Vars().Get("id")}))
 	}))
 
 	// Console API 是只读的聚合视图，使用普通 JSON，避免把运维查询混入领域 Protobuf。
-	route.GET("/console/overview", withOperation("/swarmos.console.v1.Console/Overview", func(ctx khttp.Context) error {
+	route.GET("/console/overview", withOperation("/swarmos.console.v1.Console/Overview", func(ctx khttp.Context, callCtx context.Context) error {
 		id, err := consoleID(ctx.Query().Get("swarm_id"), "swarm_id")
 		if err != nil {
 			return err
 		}
-		value, err := consoleSvc.Overview(ctx, id)
+		value, err := consoleSvc.Overview(callCtx, id)
 		if err != nil {
 			return err
 		}
 		return ctx.JSON(http.StatusOK, value)
 	}))
-	route.GET("/console/attempts", withOperation("/swarmos.console.v1.Console/ListAttempts", func(ctx khttp.Context) error {
+	route.GET("/console/attempts", withOperation("/swarmos.console.v1.Console/ListAttempts", func(ctx khttp.Context, callCtx context.Context) error {
 		id, err := consoleID(ctx.Query().Get("task_id"), "task_id")
 		if err != nil {
 			return err
 		}
-		items, err := consoleSvc.Attempts(ctx, id)
+		items, err := consoleSvc.Attempts(callCtx, id)
 		if err != nil {
 			return err
 		}
 		return ctx.JSON(http.StatusOK, map[string]any{"items": items})
 	}))
-	route.GET("/console/events", withOperation("/swarmos.console.v1.Console/ListEvents", func(ctx khttp.Context) error {
+	route.GET("/console/events", withOperation("/swarmos.console.v1.Console/ListEvents", func(ctx khttp.Context, callCtx context.Context) error {
 		id, err := consoleID(ctx.Query().Get("swarm_id"), "swarm_id")
 		if err != nil {
 			return err
 		}
-		items, err := consoleSvc.Events(ctx, id)
+		items, err := consoleSvc.Events(callCtx, id)
 		if err != nil {
 			return err
 		}
@@ -146,17 +146,17 @@ func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, cons
 	return srv
 }
 
+// observedHandler 同时接收 Kratos HTTP Context 与中间件产生的调用 Context：前者负责绑定和
+// 编码 HTTP 数据，后者必须传入 service/仓储，才能传播 Trace、取消信号与截止时间。
+type observedHandler func(khttp.Context, context.Context) error
+
 // withOperation 为手写 REST 路由补齐 Kratos 生成代码同等的执行语义：先设置固定操作名，
 // 再进入 recovery、trace、metrics、logging 中间件链。固定操作名不会把资源 ID 写入指标标签。
-func withOperation(operation string, next khttp.HandlerFunc) khttp.HandlerFunc {
+func withOperation(operation string, next observedHandler) khttp.HandlerFunc {
 	return func(ctx khttp.Context) error {
 		khttp.SetOperation(ctx, operation)
-		originalRequest := ctx.Request()
 		handler := ctx.Middleware(func(callCtx context.Context, _ any) (any, error) {
-			// Kratos 中间件返回的 callCtx 含新建 Span；把它装回 HTTP Context，确保 service、
-			// PostgreSQL 以及日志读取到同一条链路，而不是只在传输层创建孤立 Span。
-			ctx.Reset(ctx.Response(), originalRequest.WithContext(callCtx))
-			return nil, next(ctx)
+			return nil, next(ctx, callCtx)
 		})
 		_, err := handler(ctx, nil)
 		return err
@@ -172,13 +172,13 @@ func consoleID(raw, field string) (uuid.UUID, error) {
 }
 
 // unaryBody 是带 protobuf JSON 请求体的通用处理器。
-func unaryBody[Req any, Reply any](status int, call func(context.Context, *Req) (*Reply, error)) khttp.HandlerFunc {
-	return func(ctx khttp.Context) error {
+func unaryBody[Req any, Reply any](status int, call func(context.Context, *Req) (*Reply, error)) observedHandler {
+	return func(ctx khttp.Context, callCtx context.Context) error {
 		request := new(Req)
 		if err := ctx.Bind(request); err != nil {
 			return err
 		}
-		reply, err := call(ctx, request)
+		reply, err := call(callCtx, request)
 		if err != nil {
 			return err
 		}
