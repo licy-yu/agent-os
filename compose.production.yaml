@@ -1,0 +1,52 @@
+name: swarmos
+
+# 目标机基础设施只绑定 127.0.0.1，因此两个应用容器使用 Linux host network。
+# 应用仍以非 root、只读文件系统运行，并丢弃全部 Linux capabilities。
+x-app-security: &app-security
+  network_mode: host
+  env_file:
+    - .env
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "5"
+
+services:
+  control-plane:
+    <<: *app-security
+    image: swarmos-app:v0.1.0
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: swarmos-control-plane
+    command: ["/app/bin/control-plane", "-config", "/app/configs/config.yaml"]
+    environment:
+      # 镜像内路径不能继承宿主机相对路径；其余敏感值继续从 .env 注入。
+      SWARMOS_WEB_DIR: /app/web/dist
+      SWARMOS_WORKER_METRICS_ADDR: 127.0.0.1:9465
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  worker:
+    <<: *app-security
+    image: swarmos-app:v0.1.0
+    container_name: swarmos-worker
+    command: ["/app/bin/worker", "-config", "/app/configs/config.yaml"]
+    environment:
+      SWARMOS_WORKER_METRICS_ADDR: 127.0.0.1:9465
+    depends_on:
+      control-plane:
+        condition: service_healthy

@@ -57,13 +57,23 @@ Metrics 标签只放服务、方法、状态码等低基数字段；Swarm/Task/A
 3. 执行 `bash scripts/install-systemd.sh`；
 4. 验证健康、指标、控制台 API 和静态页面。
 
-systemd 使用独立的控制面/Worker 服务，包含自动重启、优雅终止、文件描述符上限和宿主加固。它不会修改 `.env`，也不会把密钥输出到日志。
+目标机账号可使用 sudo 时，`scripts/install-systemd.sh` 会安装独立的控制面/Worker 服务，包含自动重启、优雅终止、文件描述符上限和宿主加固。它不会修改 `.env`，也不会把密钥输出到日志。
+
+目标机账号已经加入 `docker` 组但不能非交互 sudo 时，使用生产 Compose：
+
+```bash
+docker compose -f compose.production.yaml up -d --build
+docker compose -f compose.production.yaml ps
+```
+
+生产镜像以 UID 10001 运行，容器根文件系统只读、丢弃全部 capabilities，并启用日志轮转。`.dockerignore` 使用“默认拒绝”白名单，`.env`、Git 历史和本地依赖不会发送到 Docker 构建上下文。容器使用 host network 是因为目标服务器的中间件只绑定 `127.0.0.1`；此决策仅适用于受控 Linux 主机，不能直接照搬到多租户节点。
 
 常用命令：
 
 ```bash
 sudo systemctl status swarmos-control-plane swarmos-worker
 sudo journalctl -u swarmos-control-plane -u swarmos-worker -f
+docker compose -f compose.production.yaml logs -f --tail=200
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/metrics
 curl --fail http://127.0.0.1:9465/metrics
@@ -73,6 +83,8 @@ curl --fail http://127.0.0.1:9465/metrics
 
 ```bash
 sudo systemctl restart swarmos-control-plane swarmos-worker
+# 或者
+docker compose -f compose.production.yaml up -d --build
 ```
 
 数据库迁移采用只前进策略；涉及破坏性 DDL 的未来版本必须先做兼容迁移和数据备份，不能把数据库直接回滚到旧 schema。

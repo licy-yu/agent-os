@@ -63,6 +63,7 @@ internal/console/       只读运维聚合视图
 internal/observability/ OpenTelemetry 与 Prometheus 初始化
 web/                    React/TypeScript 运维控制台
 deploy/                 systemd 生产服务定义
+compose.production.yaml 生产容器编排（复用宿主机中间件）
 ```
 
 ## 安全约束

@@ -1,0 +1,13 @@
+# 默认不向 Docker daemon 发送任何文件，再按生产镜像所需内容逐项放行。
+# 这样即使工作目录存在 .env、Git 历史或本地缓存，也不会进入构建上下文。
+*
+!deploy/
+!deploy/Dockerfile
+!bin/
+!bin/control-plane
+!bin/worker
+!configs/
+!configs/config.yaml
+!web/
+!web/dist/
+!web/dist/**
