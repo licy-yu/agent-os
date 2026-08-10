@@ -20,7 +20,7 @@
 
 ## 阶段 3：执行和可靠性
 
-状态：已完成实现与目标服务器验收。
+状态：已完成（提交 `1fe2888`）并通过目标服务器验收。
 
 - Worker 创建 Attempt 并按步骤保存 Checkpoint；
 - Tool Gateway 执行权限、风险、预算、限流和审计；
@@ -29,7 +29,9 @@
 
 ## 阶段 4：控制台和部署
 
+状态：已完成实现，生产发布按 `docs/phase-4-console-observability-deployment.md` 执行。
+
 - Web Console 可查看 Swarm、DAG、Agent、Attempt 和事件；
 - Trace、Metrics、结构化日志可关联 swarm/task/attempt；
-- Docker Compose 可在目标 Ubuntu 服务器部署；
+- systemd 管理两个 Go 进程，PostgreSQL、认证 Redis 和 NATS JetStream 使用目标服务器现有基础设施；
 - 端到端示例任务通过，回滚与运维步骤有文档。

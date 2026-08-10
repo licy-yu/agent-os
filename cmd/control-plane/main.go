@@ -9,12 +9,15 @@ import (
 
 	"github.com/go-kratos/kratos/v2"
 	"github.com/go-kratos/kratos/v2/log"
+	"github.com/go-kratos/kratos/v2/middleware/tracing"
 	"github.com/google/uuid"
 	"github.com/licy-yu/agent-os/internal/conf"
+	consoleview "github.com/licy-yu/agent-os/internal/console"
 	"github.com/licy-yu/agent-os/internal/data/postgres"
 	"github.com/licy-yu/agent-os/internal/event"
 	"github.com/licy-yu/agent-os/internal/infrastructure/natsevent"
 	"github.com/licy-yu/agent-os/internal/infrastructure/redislease"
+	"github.com/licy-yu/agent-os/internal/observability"
 	"github.com/licy-yu/agent-os/internal/orchestrator"
 	"github.com/licy-yu/agent-os/internal/server"
 	"github.com/licy-yu/agent-os/internal/service"
@@ -34,16 +37,27 @@ func main() {
 		"service", "swarmos-control-plane",
 		"version", buildVersion,
 		"commit", buildCommit,
+		"trace_id", tracing.TraceID(),
+		"span_id", tracing.SpanID(),
 	)
 
 	cfg, err := conf.Load(*configPath)
 	if err != nil {
 		log.NewHelper(logger).Fatalf("加载配置失败: %v", err)
 	}
-
-	// 启动阶段设置超时，防止数据库网络故障让进程永久卡在初始化。
 	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	telemetry, err := observability.New(initCtx, cfg.Observability, "swarmos-control-plane", buildVersion, cfg.Server.Environment)
+	if err != nil {
+		log.NewHelper(logger).Fatalf("初始化可观测性失败: %v", err)
+	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = telemetry.Shutdown(shutdownCtx)
+	}()
+
+	// 启动阶段设置超时，防止数据库网络故障让进程永久卡在初始化。
 	repository, err := postgres.New(initCtx, cfg.Data.DatabaseDSN)
 	if err != nil {
 		log.NewHelper(logger).Fatalf("初始化数据层失败: %v", err)
@@ -64,8 +78,9 @@ func main() {
 	defer func() { _ = eventBus.Close() }()
 
 	svc := service.NewControlPlaneService(repository, repository, repository, repository)
-	httpServer := server.NewHTTPServer(cfg.Server, svc, logger)
-	grpcServer := server.NewGRPCServer(cfg.Server, svc, logger)
+	consoleSvc := consoleview.NewService(repository)
+	httpServer := server.NewHTTPServer(cfg.Server, svc, consoleSvc, telemetry, logger)
+	grpcServer := server.NewGRPCServer(cfg.Server, svc, telemetry, logger)
 	taskController := orchestrator.NewTaskController(repository, logger)
 	agentController := orchestrator.NewAgentController(repository)
 	scheduler := orchestrator.NewScheduler(repository, leaseManager, cfg.Runtime.LeaseTTL, logger)

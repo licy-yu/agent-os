@@ -16,10 +16,11 @@ import (
 
 // Config 是控制面进程的完整配置。
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Data    DataConfig    `yaml:"data"`
-	Runtime RuntimeConfig `yaml:"runtime"`
-	Worker  WorkerConfig  `yaml:"worker"`
+	Server        ServerConfig        `yaml:"server"`
+	Data          DataConfig          `yaml:"data"`
+	Runtime       RuntimeConfig       `yaml:"runtime"`
+	Worker        WorkerConfig        `yaml:"worker"`
+	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 // WorkerConfig 控制独立执行进程的 Durable Consumer、并发和双层心跳。
@@ -28,6 +29,12 @@ type WorkerConfig struct {
 	Concurrency       int           `yaml:"concurrency"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
 	AckWait           time.Duration `yaml:"ack_wait"`
+	MetricsAddr       string        `yaml:"metrics_addr"`
+}
+
+// ObservabilityConfig 只保存非敏感采样策略；OTLP 端点和鉴权使用 OpenTelemetry 标准环境变量。
+type ObservabilityConfig struct {
+	TraceSampleRatio float64 `yaml:"trace_sample_ratio"`
 }
 
 // ServerConfig 描述 Kratos HTTP/gRPC 监听参数。
@@ -36,6 +43,7 @@ type ServerConfig struct {
 	Environment     string        `yaml:"environment"`
 	HTTPAddr        string        `yaml:"http_addr"`
 	GRPCAddr        string        `yaml:"grpc_addr"`
+	WebDir          string        `yaml:"web_dir"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 }
 
@@ -67,7 +75,8 @@ func Load(path string) (*Config, error) {
 	cfg := Config{Worker: WorkerConfig{
 		Durable: "swarmos-workers", Concurrency: 4,
 		HeartbeatInterval: 10 * time.Second, AckWait: 30 * time.Second,
-	}}
+		MetricsAddr: "127.0.0.1:9465",
+	}, Observability: ObservabilityConfig{TraceSampleRatio: .1}}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件 %q: %w", path, err)
 	}
@@ -85,6 +94,7 @@ func applyEnvironment(cfg *Config) {
 	overrideString("SWARMOS_ENVIRONMENT", &cfg.Server.Environment)
 	overrideString("SWARMOS_HTTP_ADDR", &cfg.Server.HTTPAddr)
 	overrideString("SWARMOS_GRPC_ADDR", &cfg.Server.GRPCAddr)
+	overrideString("SWARMOS_WEB_DIR", &cfg.Server.WebDir)
 	overrideDuration("SWARMOS_SHUTDOWN_TIMEOUT", &cfg.Server.ShutdownTimeout)
 
 	overrideString("SWARMOS_DATABASE_DSN", &cfg.Data.DatabaseDSN)
@@ -101,6 +111,8 @@ func applyEnvironment(cfg *Config) {
 	overrideInt("SWARMOS_WORKER_CONCURRENCY", &cfg.Worker.Concurrency)
 	overrideDuration("SWARMOS_WORKER_HEARTBEAT_INTERVAL", &cfg.Worker.HeartbeatInterval)
 	overrideDuration("SWARMOS_WORKER_ACK_WAIT", &cfg.Worker.AckWait)
+	overrideString("SWARMOS_WORKER_METRICS_ADDR", &cfg.Worker.MetricsAddr)
+	overrideFloat("SWARMOS_TRACE_SAMPLE_RATIO", &cfg.Observability.TraceSampleRatio)
 }
 
 func overrideInt(name string, target *int) {
@@ -109,6 +121,19 @@ func overrideInt(name string, target *int) {
 		return
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		*target = -1
+		return
+	}
+	*target = parsed
+}
+
+func overrideFloat(name string, target *float64) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		*target = -1
 		return
@@ -165,6 +190,10 @@ func (c Config) Validate() error {
 		return errors.New("worker.heartbeat_interval 必须是正时长")
 	case c.Worker.AckWait <= c.Worker.HeartbeatInterval:
 		return errors.New("worker.ack_wait 必须大于 heartbeat_interval")
+	case c.Worker.MetricsAddr == "":
+		return errors.New("worker.metrics_addr 不能为空")
+	case c.Observability.TraceSampleRatio < 0 || c.Observability.TraceSampleRatio > 1:
+		return errors.New("observability.trace_sample_ratio 必须在 0~1 之间")
 	}
 	return nil
 }

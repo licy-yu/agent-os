@@ -1,0 +1,38 @@
+[Unit]
+Description=SwarmOS Kratos Control Plane
+Documentation=https://github.com/licy-yu/agent-os
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=hale
+Group=hale
+WorkingDirectory=/srv/projects/agent-os
+EnvironmentFile=/srv/projects/agent-os/.env
+Environment=GOMEMLIMIT=512MiB
+ExecStartPre=/usr/bin/test -x /srv/projects/agent-os/bin/control-plane
+ExecStartPre=/usr/bin/test -r /srv/projects/agent-os/configs/config.yaml
+ExecStart=/srv/projects/agent-os/bin/control-plane -config /srv/projects/agent-os/configs/config.yaml
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+UMask=0077
+
+# 控制面只需读取代码与静态资源；数据库、Redis 和 NATS 均通过网络访问。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

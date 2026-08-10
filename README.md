@@ -28,16 +28,20 @@ A2A、AgentSet 自动扩缩和自动进化属于 V2/V3，不会混进 V1 的核�
 
 ## 本地启动
 
+首次启动前构建 Web Console：
+
 ```bash
+cd web && npm ci && npm run build && cd ..
 docker compose up -d postgres redis nats
 go run ./cmd/control-plane -config ./configs/config.yaml
 go run ./cmd/worker -config ./configs/config.yaml
 ```
 
-健康检查：
+健康检查与控制台：
 
 ```bash
 curl http://127.0.0.1:8080/healthz
+# 浏览器打开 http://127.0.0.1:8080/
 ```
 
 ## 工程目录
@@ -55,6 +59,10 @@ internal/server/        HTTP/gRPC 传输层
 internal/worker/        Agent 执行循环与模型适配
 internal/toolgateway/   工具权限、额度、审计和 MCP 适配
 internal/execution/     Attempt/Checkpoint/Evaluation 执行合同
+internal/console/       只读运维聚合视图
+internal/observability/ OpenTelemetry 与 Prometheus 初始化
+web/                    React/TypeScript 运维控制台
+deploy/                 systemd 生产服务定义
 ```
 
 ## 安全约束
@@ -67,3 +75,4 @@ internal/execution/     Attempt/Checkpoint/Evaluation 执行合同
 
 - [阶段 2：Controller、Scheduler 与可靠事件](docs/phase-2-orchestration.md)
 - [阶段 3：Worker、工具治理、审查与恢复](docs/phase-3-execution.md)
+- [阶段 4：控制台、可观测性与部署](docs/phase-4-console-observability-deployment.md)

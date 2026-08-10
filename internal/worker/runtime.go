@@ -14,6 +14,10 @@ import (
 	"github.com/licy-yu/agent-os/internal/assignment"
 	"github.com/licy-yu/agent-os/internal/execution"
 	"github.com/licy-yu/agent-os/internal/toolgateway"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type assignedEvent struct {
@@ -133,6 +137,16 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 		// 已处理或已重新绑定的陈旧消息可以安全 ACK。
 		return message.Ack(parent)
 	}
+	parent, span := otel.Tracer("swarmos/worker").Start(parent, "worker.execute",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("swarmos.task.id", work.Task.ID.String()),
+			attribute.String("swarmos.agent.id", work.Agent.ID.String()),
+			attribute.String("swarmos.attempt.id", work.Attempt.ID.String()),
+			attribute.String("gen_ai.request.model", work.Template.Model),
+		),
+	)
+	defer span.End()
 
 	timeout := work.Task.ExecutionPolicy.Timeout()
 	if timeout <= 0 {
@@ -149,6 +163,8 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 	cancel()
 	<-heartbeatDone
 	if executeErr != nil {
+		span.RecordError(executeErr)
+		span.SetStatus(codes.Error, executeErr.Error())
 		// 模型/工具错误也形成 Reviewer 可见证据，避免只能等待心跳超时才能重试。
 		result.Output = map[string]any{"execution_error": executeErr.Error()}
 		result.Checks = map[string]bool{"execution": false}
@@ -158,11 +174,16 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 		}
 	}
 	if err := r.store.CompleteAttempt(parent, work.Attempt.ID, result); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("提交 attempt %s 结果: %w", work.Attempt.ID, err)
 	}
 	if err := message.Ack(parent); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("确认 task %s 消息: %w", event.TaskID, err)
 	}
+	span.SetStatus(codes.Ok, "execution submitted for review")
 	return nil
 }
 

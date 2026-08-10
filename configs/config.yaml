@@ -3,6 +3,8 @@ server:
   environment: development
   http_addr: 0.0.0.0:8080
   grpc_addr: 0.0.0.0:9090
+  # 控制台生产构建由控制面同源托管；API 路由优先于 SPA 回退路由。
+  web_dir: ./web/dist
   shutdown_timeout: 10s
 
 data:
@@ -24,3 +26,9 @@ worker:
   concurrency: 4
   heartbeat_interval: 10s
   ack_wait: 30s
+  # 默认只允许同机 Prometheus 抓取；如需远程抓取请显式覆盖监听地址并配置防火墙。
+  metrics_addr: 127.0.0.1:9465
+
+observability:
+  # 生产默认采样 10%；错误 Span 仍会记录状态，OTLP 端点通过标准环境变量注入。
+  trace_sample_ratio: 0.1

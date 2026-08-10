@@ -20,6 +20,8 @@ NATS JetStream ---- Agent Worker ---- Tool Gateway ---- MCP / Shell / Git / DB
 Redis Lease / Heartbeat Cache
 ```
 
+Web Console 的生产构建由控制面同源托管，运维读请求经过 `internal/console` 聚合层访问 PostgreSQL，浏览器不接触数据库。控制面和 Worker 都输出 OpenTelemetry Trace、OpenMetrics 与带 Trace ID 的结构化日志。
+
 ## 2. 一致性策略
 
 1. PostgreSQL 是任务、Agent 和预算的最终事实源。
@@ -55,4 +57,3 @@ QueueSort -> PreFilter -> Filter -> Score -> Reserve -> Bind -> Execute
 ## 5. 版本兼容决策
 
 项目运行环境为 Go 1.24.13。Kratos v3.0.0 和当前最新 pgx/NATS Go 客户端要求 Go 1.25，因此 V1 使用仍受支持且兼容 Go 1.24 的依赖版本。升级 Go 与 Kratos 主版本必须单独做兼容性阶段，不能在业务提交中隐式升级。
-

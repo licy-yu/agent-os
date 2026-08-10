@@ -18,6 +18,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/licy-yu/agent-os/internal/execution"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -98,11 +102,25 @@ func New(store Store, work *execution.Work, adapters map[string]Adapter) *Gatewa
 func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]any) (map[string]any, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	ctx, span := otel.Tracer("swarmos/tool-gateway").Start(ctx, "tool.call",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("swarmos.tool.name", name),
+			attribute.String("swarmos.attempt.id", g.attemptID.String()),
+		),
+	)
+	defer span.End()
 
 	definition, err := g.store.GetToolDefinition(ctx, name)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("读取工具 %s: %w", name, err)
 	}
+	span.SetAttributes(
+		attribute.String("swarmos.tool.adapter", definition.Adapter),
+		attribute.String("swarmos.tool.risk_level", definition.RiskLevel),
+	)
 	record := CallRecord{
 		ID: uuid.New(), AttemptID: g.attemptID, TaskID: g.taskID, AgentID: g.agentID,
 		ToolName: name, Arguments: arguments, Status: "STARTED", RiskLevel: definition.RiskLevel,
@@ -110,6 +128,7 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 	}
 	denial := g.denialReason(definition)
 	if denial != "" {
+		span.SetStatus(codes.Error, denial)
 		record.Status, record.ErrorMessage = "DENIED", denial
 		// 被拒绝的调用也占用调用额度，防止恶意模型通过重复试探制造无限循环。
 		if beginErr := g.store.BeginToolCall(ctx, record, g.maxCalls); beginErr != nil {
@@ -119,6 +138,7 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 	}
 	adapter, ok := g.adapters[strings.ToLower(definition.Adapter+":"+definition.Name)]
 	if !ok {
+		span.SetStatus(codes.Error, "adapter unavailable")
 		// mcp:* 等通配适配器承载同一种传输的多个远端工具，具体端点仍来自受控注册表。
 		adapter, ok = g.adapters[strings.ToLower(definition.Adapter+":*")]
 	}
@@ -130,10 +150,14 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 		return nil, fmt.Errorf("%w: 工具 %s 未安装适配器", ErrDenied, name)
 	}
 	if err := g.store.BeginToolCall(ctx, record, g.maxCalls); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	result, callErr := adapter.Call(ctx, definition, arguments)
 	if callErr != nil {
+		span.RecordError(callErr)
+		span.SetStatus(codes.Error, callErr.Error())
 		finishErr := g.store.FinishToolCall(ctx, record.ID, "FAILED", nil, callErr.Error())
 		if finishErr != nil {
 			return nil, fmt.Errorf("调用失败且结束审计失败: call=%v audit=%w", callErr, finishErr)
@@ -141,8 +165,11 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 		return nil, callErr
 	}
 	if err := g.store.FinishToolCall(ctx, record.ID, "SUCCEEDED", result, ""); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
+	span.SetStatus(codes.Ok, "tool call succeeded")
 	return result, nil
 }
 

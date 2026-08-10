@@ -1,4 +1,4 @@
-.PHONY: proto fmt test test-race build run run-worker infra-up infra-down
+.PHONY: proto fmt test test-race web-build build run run-worker infra-up infra-down
 
 # 生成 protobuf 与 gRPC 代码。生成结果提交到仓库，部署机无需安装 protoc。
 proto:
@@ -15,7 +15,10 @@ test:
 test-race:
 	go test -race ./...
 
-build:
+web-build:
+	cd web && npm ci && npm run build
+
+build: web-build
 	go build -trimpath -o bin/control-plane ./cmd/control-plane
 	go build -trimpath -o bin/worker ./cmd/worker
 

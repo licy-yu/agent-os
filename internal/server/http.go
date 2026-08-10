@@ -8,21 +8,31 @@ import (
 
 	kratosErrors "github.com/go-kratos/kratos/v2/errors"
 	"github.com/go-kratos/kratos/v2/log"
+	"github.com/go-kratos/kratos/v2/middleware"
 	"github.com/go-kratos/kratos/v2/middleware/logging"
 	"github.com/go-kratos/kratos/v2/middleware/recovery"
 	khttp "github.com/go-kratos/kratos/v2/transport/http"
+	"github.com/google/uuid"
 	v1 "github.com/licy-yu/agent-os/api/controlplane/v1"
 	"github.com/licy-yu/agent-os/internal/conf"
+	consoleview "github.com/licy-yu/agent-os/internal/console"
+	"github.com/licy-yu/agent-os/internal/observability"
 	"github.com/licy-yu/agent-os/internal/service"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // NewHTTPServer 注册显式 REST 路由。
 // API 内部仍复用 protobuf 消息与 service 方法，因此它不是另一套业务实现。
-func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, logger log.Logger) *khttp.Server {
+
+func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, consoleSvc *consoleview.Service,
+	telemetry *observability.Telemetry, logger log.Logger,
+) *khttp.Server {
+	middlewares := []middleware.Middleware{recovery.Recovery()}
+	middlewares = append(middlewares, telemetry.Middlewares()...)
+	middlewares = append(middlewares, logging.Server(logger))
 	srv := khttp.NewServer(
 		khttp.Address(cfg.HTTPAddr),
-		khttp.Middleware(recovery.Recovery(), logging.Server(logger)),
+		khttp.Middleware(middlewares...),
 	)
 
 	srv.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +45,7 @@ func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, logg
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte(reply.Status + "\n"))
 	})
+	srv.Handle("/metrics", telemetry.MetricsHandler())
 
 	route := srv.Route("/api/v1")
 	route.POST("/swarms", unaryBody(http.StatusCreated, svc.CreateSwarm))
@@ -79,7 +90,56 @@ func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, logg
 	route.GET("/tasks/{id}", func(ctx khttp.Context) error {
 		return ctx.Returns(svc.GetTask(ctx, &v1.GetTaskRequest{Id: ctx.Vars().Get("id")}))
 	})
+
+	// Console API 是只读的聚合视图，使用普通 JSON，避免把运维查询混入领域 Protobuf。
+	route.GET("/console/overview", func(ctx khttp.Context) error {
+		id, err := consoleID(ctx.Query().Get("swarm_id"), "swarm_id")
+		if err != nil {
+			return err
+		}
+		value, err := consoleSvc.Overview(ctx, id)
+		if err != nil {
+			return err
+		}
+		return ctx.JSON(http.StatusOK, value)
+	})
+	route.GET("/console/attempts", func(ctx khttp.Context) error {
+		id, err := consoleID(ctx.Query().Get("task_id"), "task_id")
+		if err != nil {
+			return err
+		}
+		items, err := consoleSvc.Attempts(ctx, id)
+		if err != nil {
+			return err
+		}
+		return ctx.JSON(http.StatusOK, map[string]any{"items": items})
+	})
+	route.GET("/console/events", func(ctx khttp.Context) error {
+		id, err := consoleID(ctx.Query().Get("swarm_id"), "swarm_id")
+		if err != nil {
+			return err
+		}
+		items, err := consoleSvc.Events(ctx, id)
+		if err != nil {
+			return err
+		}
+		return ctx.JSON(http.StatusOK, map[string]any{"items": items})
+	})
+
+	// SPA 必须最后注册。Kratos 路由器会优先匹配前面已经声明的 API、健康检查和指标端点，
+	// 其余浏览器路径再回退到 index.html，从而支持前端刷新深层路由。
+	if cfg.WebDir != "" {
+		srv.HandlePrefix("/", newSPAHandler(cfg.WebDir))
+	}
 	return srv
+}
+
+func consoleID(raw, field string) (uuid.UUID, error) {
+	value, err := uuid.Parse(raw)
+	if err != nil {
+		return uuid.Nil, kratosErrors.BadRequest("INVALID_ID", field+" 必须是 UUID")
+	}
+	return value, nil
 }
 
 // unaryBody 是带 protobuf JSON 请求体的通用处理器。

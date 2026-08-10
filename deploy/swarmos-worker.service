@@ -1,0 +1,38 @@
+[Unit]
+Description=SwarmOS Agent Worker
+Documentation=https://github.com/licy-yu/agent-os
+Wants=network-online.target
+After=network-online.target docker.service swarmos-control-plane.service
+
+[Service]
+Type=simple
+User=hale
+Group=hale
+WorkingDirectory=/srv/projects/agent-os
+EnvironmentFile=/srv/projects/agent-os/.env
+Environment=GOMEMLIMIT=1GiB
+ExecStartPre=/usr/bin/test -x /srv/projects/agent-os/bin/worker
+ExecStartPre=/usr/bin/test -r /srv/projects/agent-os/configs/config.yaml
+ExecStart=/srv/projects/agent-os/bin/worker -config /srv/projects/agent-os/configs/config.yaml
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+UMask=0077
+
+# Worker 可以访问模型与 MCP 网络端点，但不能提升权限或修改宿主系统目录。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
