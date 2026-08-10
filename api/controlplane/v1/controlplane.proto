@@ -1,0 +1,180 @@
+syntax = "proto3";
+
+package swarmos.controlplane.v1;
+
+option go_package = "github.com/licy-yu/agent-os/api/controlplane/v1;v1";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// ControlPlane 是 SwarmOS 的外部资源 API。
+// HTTP 与 gRPC 使用同一套消息，避免两套接口在字段和状态语义上漂移。
+service ControlPlane {
+  rpc Health(google.protobuf.Empty) returns (HealthReply);
+
+  rpc CreateSwarm(CreateSwarmRequest) returns (Swarm);
+  rpc GetSwarm(GetSwarmRequest) returns (Swarm);
+  rpc ListSwarms(ListSwarmsRequest) returns (ListSwarmsReply);
+
+  rpc CreateAgentTemplate(CreateAgentTemplateRequest) returns (AgentTemplate);
+  rpc ListAgentTemplates(ListAgentTemplatesRequest) returns (ListAgentTemplatesReply);
+  rpc RegisterAgent(RegisterAgentRequest) returns (AgentInstance);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsReply);
+
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+  rpc GetTask(GetTaskRequest) returns (Task);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksReply);
+}
+
+message HealthReply {
+  string status = 1;
+  string service = 2;
+  string version = 3;
+}
+
+message PageRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message Swarm {
+  string id = 1;
+  string name = 2;
+  string goal = 3;
+  string status = 4;
+  int64 budget_tokens = 5;
+  int64 budget_cost_micros = 6;
+  int32 max_agents = 7;
+  google.protobuf.Struct policy = 8;
+  int64 version = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message CreateSwarmRequest {
+  string name = 1;
+  string goal = 2;
+  int64 budget_tokens = 3;
+  int64 budget_cost_micros = 4;
+  int32 max_agents = 5;
+  google.protobuf.Struct policy = 6;
+}
+
+message GetSwarmRequest { string id = 1; }
+
+message ListSwarmsRequest { PageRequest page = 1; }
+
+message ListSwarmsReply {
+  repeated Swarm items = 1;
+  string next_page_token = 2;
+}
+
+message AgentTemplate {
+  string id = 1;
+  string name = 2;
+  string role = 3;
+  string prompt = 4;
+  string model = 5;
+  map<string, double> skills = 6;
+  repeated string tools = 7;
+  repeated string permissions = 8;
+  string template_version = 9;
+  bool enabled = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+}
+
+message CreateAgentTemplateRequest {
+  string name = 1;
+  string role = 2;
+  string prompt = 3;
+  string model = 4;
+  map<string, double> skills = 5;
+  repeated string tools = 6;
+  repeated string permissions = 7;
+  string template_version = 8;
+}
+
+message ListAgentTemplatesRequest { PageRequest page = 1; }
+
+message ListAgentTemplatesReply {
+  repeated AgentTemplate items = 1;
+  string next_page_token = 2;
+}
+
+message AgentInstance {
+  string id = 1;
+  string template_id = 2;
+  string swarm_id = 3;
+  string name = 4;
+  string status = 5;
+  double load = 6;
+  google.protobuf.Timestamp heartbeat_at = 7;
+  int64 version = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message RegisterAgentRequest {
+  string template_id = 1;
+  string swarm_id = 2;
+  string name = 3;
+}
+
+message ListAgentsRequest {
+  string swarm_id = 1;
+  PageRequest page = 2;
+}
+
+message ListAgentsReply {
+  repeated AgentInstance items = 1;
+  string next_page_token = 2;
+}
+
+message Task {
+  string id = 1;
+  string swarm_id = 2;
+  string parent_id = 3;
+  string name = 4;
+  string goal = 5;
+  string status = 6;
+  int32 priority = 7;
+  google.protobuf.Struct input = 8;
+  google.protobuf.Struct requirements = 9;
+  google.protobuf.Struct acceptance = 10;
+  google.protobuf.Struct execution_policy = 11;
+  repeated string dependency_ids = 12;
+  string assigned_agent_id = 13;
+  int32 attempt_count = 14;
+  int64 version = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+}
+
+message CreateTaskRequest {
+  string swarm_id = 1;
+  string parent_id = 2;
+  string name = 3;
+  string goal = 4;
+  int32 priority = 5;
+  google.protobuf.Struct input = 6;
+  google.protobuf.Struct requirements = 7;
+  google.protobuf.Struct acceptance = 8;
+  google.protobuf.Struct execution_policy = 9;
+  repeated string dependency_ids = 10;
+}
+
+message GetTaskRequest { string id = 1; }
+
+message ListTasksRequest {
+  string swarm_id = 1;
+  string status = 2;
+  PageRequest page = 3;
+}
+
+message ListTasksReply {
+  repeated Task items = 1;
+  string next_page_token = 2;
+}
+

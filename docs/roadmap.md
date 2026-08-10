@@ -1,0 +1,30 @@
+# 实施阶段与验收标准
+
+## 阶段 1：基础控制面
+
+- 工程可以在 Go 1.24 编译；
+- 核心资源具有领域模型、状态机、PostgreSQL DDL 和仓储；
+- Kratos 同时提供 HTTP 与 gRPC API；
+- migration、单元测试和静态检查通过。
+
+## 阶段 2：编排和调度
+
+- 依赖完成后 Task 能从 BLOCKED 进入 READY；
+- Filter / Score 插件可独立测试；
+- Redis Lease + PostgreSQL CAS 完成 Reserve / Bind；
+- Transactional Outbox 能可靠投递 JetStream。
+
+## 阶段 3：执行和可靠性
+
+- Worker 创建 Attempt 并按步骤保存 Checkpoint；
+- Tool Gateway 执行权限、风险、预算、限流和审计；
+- Reviewer 同时支持确定性检查与策略检查；
+- 心跳超时可触发恢复和有上限重试。
+
+## 阶段 4：控制台和部署
+
+- Web Console 可查看 Swarm、DAG、Agent、Attempt 和事件；
+- Trace、Metrics、结构化日志可关联 swarm/task/attempt；
+- Docker Compose 可在目标 Ubuntu 服务器部署；
+- 端到端示例任务通过，回滚与运维步骤有文档。
+

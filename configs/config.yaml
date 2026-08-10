@@ -1,0 +1,20 @@
+server:
+  name: swarmos-control-plane
+  environment: development
+  http_addr: 0.0.0.0:8080
+  grpc_addr: 0.0.0.0:9090
+  shutdown_timeout: 10s
+
+data:
+  # 这里只能放本地开发默认值；部署环境必须通过环境变量覆盖密码。
+  database_dsn: postgres://swarmos:swarmos@127.0.0.1:55432/swarmos?sslmode=disable
+  redis_addr: 127.0.0.1:56379
+  redis_password: ""
+  nats_url: nats://127.0.0.1:54222
+
+runtime:
+  heartbeat_timeout: 60s
+  lease_ttl: 30s
+  reconcile_interval: 5s
+  outbox_interval: 1s
+

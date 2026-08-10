@@ -1,0 +1,29 @@
+# Go 构建产物
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# 本地配置与密钥（仓库只提交 .env.example）
+.env
+.env.*
+!.env.example
+configs/config.local.yaml
+**/CREDENTIALS.local.md
+
+# IDE 与操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 前端依赖及产物（阶段 4 使用）
+web/node_modules/
+web/dist/
+
+# 临时文件和运行数据
+/tmp/
+/data/
+*.log
