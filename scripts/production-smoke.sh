@@ -10,6 +10,13 @@ if [[ "${health}" != "ok"$'\n' && "${health}" != "ok" ]]; then
   echo "控制面健康检查返回异常: ${health}" >&2
   exit 1
 fi
+# 使用 Python 标准库解析 JSON，避免目标机必须额外安装 jq。
+swarms="$(curl --fail --silent --show-error "${base_url}/api/v1/swarms?page_size=50")"
+swarm_id="$(printf '%s' "${swarms}" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["items"][0]["id"])')"
+overview="$(curl --fail --silent --show-error "${base_url}/api/v1/console/overview?swarm_id=${swarm_id}")"
+
+# 先访问受中间件保护的 API 再抓指标，保证自定义 Counter/Histogram 已产生数据点。
 page="$(curl --fail --silent --show-error "${base_url}/")"
 control_metrics="$(curl --fail --silent --show-error "${base_url}/metrics")"
 worker_metrics="$(curl --fail --silent --show-error "${worker_metrics_url}")"
@@ -17,10 +24,6 @@ grep --quiet "SwarmOS Control Room" <<<"${page}"
 grep --quiet "swarmos_server_requests_total" <<<"${control_metrics}"
 grep --quiet "go_goroutines" <<<"${worker_metrics}"
 
-# 使用 Python 标准库解析 JSON，避免目标机必须额外安装 jq。
-swarm_id="$(curl --fail --silent --show-error "${base_url}/api/v1/swarms?page_size=50" \
-  | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data["items"][0]["id"])')"
-overview="$(curl --fail --silent --show-error "${base_url}/api/v1/console/overview?swarm_id=${swarm_id}")"
 printf '%s' "${overview}" | python3 -c '
 import json
 import sys
