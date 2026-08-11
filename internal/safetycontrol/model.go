@@ -282,10 +282,13 @@ type GateResultView struct {
 	GateName     string                  `json:"gateName"`
 	Status       verification.GateStatus `json:"status"`
 	EvidenceRefs []string                `json:"evidenceRefs"`
-	Metrics      map[string]float64      `json:"metrics"`
-	Message      string                  `json:"message,omitempty"`
-	StartedAt    *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt   *time.Time              `json:"finishedAt,omitempty"`
+	// Metrics 对应数据库中的 JSONB，而不是纯数值时序指标。验证器除覆盖率、耗时等
+	// 数字外，还会持久化 required/deterministic 布尔标记、引擎名称和嵌套诊断；使用
+	// any 才能无损返回这些已落库的机器证据，避免读取合法证据时因类型收窄而返回 500。
+	Metrics    map[string]any `json:"metrics"`
+	Message    string         `json:"message,omitempty"`
+	StartedAt  *time.Time     `json:"startedAt,omitempty"`
+	FinishedAt *time.Time     `json:"finishedAt,omitempty"`
 }
 
 // VerificationRunView 聚合一次 Verification 与其 Gate 结果。

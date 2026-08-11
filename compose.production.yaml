@@ -94,6 +94,11 @@ services:
       - ./deploy/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
     networks:
       - temporal-internal
+      # `internal: true` 的网络不会连接宿主机网络接口，即使声明 `ports`，
+      # host-network 的 Go 进程也无法通过 127.0.0.1:7233 访问 Temporal。
+      # 仅让 Temporal Server 额外加入普通 bridge；数据库仍只在内部网络，
+      # 7233 也继续严格绑定宿主机回环地址，不向局域网暴露。
+      - temporal-host
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7233"]
       interval: 5s
@@ -129,7 +134,8 @@ services:
 
   control-plane:
     <<: *app-security
-    image: swarmos-app:v1.5.0
+    # 生产修订版包含 Temporal 宿主网络发布与 Completion Manifest JSON 指标修复。
+    image: swarmos-app:v1.5.1
     build:
       context: .
       dockerfile: deploy/Dockerfile
@@ -154,7 +160,7 @@ services:
 
   worker:
     <<: *app-security
-    image: swarmos-app:v1.5.0
+    image: swarmos-app:v1.5.1
     container_name: swarmos-worker
     command: ["/app/bin/worker", "-config", "/app/configs/config.yaml"]
     environment:
@@ -168,7 +174,7 @@ services:
   # Temporal Workflow History 仍然保留；Workflow Worker 恢复后会从历史继续重放。
   workflow-worker:
     <<: *app-security
-    image: swarmos-app:v1.5.0
+    image: swarmos-app:v1.5.1
     container_name: swarmos-workflow-worker
     command: ["/app/bin/workflow-worker", "-config", "/app/configs/config.yaml"]
     environment:
@@ -184,6 +190,8 @@ networks:
   temporal-internal:
     name: swarmos-temporal-internal
     internal: true
+  temporal-host:
+    name: swarmos-temporal-host
 
 volumes:
   temporal-postgres-data:

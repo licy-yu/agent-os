@@ -1205,7 +1205,7 @@ func (r *Repository) loadVerificationEvidence(ctx context.Context, tenantID uuid
 		}
 		result := safetycontrol.GateResultView{
 			ID: *resultID, GateID: gate.ID, GateName: gate.Name,
-			Status: mapGateStatus(stringValue(status)), Metrics: map[string]float64{},
+			Status: mapGateStatus(stringValue(status)), Metrics: map[string]any{},
 			StartedAt: startedAt, FinishedAt: finishedAt,
 		}
 		if len(metrics) > 0 {
@@ -1252,6 +1252,10 @@ func stringValue(value *string) string {
 // GetCompletionManifest 返回任务或 Run 的不可变完成证据，并内联小型 Artifact 描述符与
 // GateResult 索引。manifest.summary 是历史 TEXT 字段；若其中是 JSON 则恢复结构，否则
 // 以 text 键包装，保持 API 始终是稳定对象。
+//
+// Run 级 Manifest 的 task_id 可以为空，因此关联 Verification 时必须始终先约束 run_id；
+// 不能依赖 task_id/attempt_id 这两个可空字段，否则历史数据中两者均为空时会误取同租户
+// 其他 Run 的最新 Verification，破坏完成证据的运行隔离。
 func (r *Repository) GetCompletionManifest(ctx context.Context, tenantID, id uuid.UUID) (*safetycontrol.CompletionManifestView, error) {
 	value := new(safetycontrol.CompletionManifestView)
 	var storedStatus string
@@ -1261,6 +1265,7 @@ func (r *Repository) GetCompletionManifest(ctx context.Context, tenantID, id uui
 		SELECT m.id,m.tenant_id,m.run_id,m.task_id,m.attempt_id,
 		       (SELECT v.id FROM verification_runs v
 		        WHERE v.tenant_id=m.tenant_id
+		          AND v.run_id=m.run_id
 		          AND (m.attempt_id IS NULL OR v.attempt_id=m.attempt_id)
 		          AND (m.task_id IS NULL OR v.task_id=m.task_id)
 		        ORDER BY v.created_at DESC,v.id DESC LIMIT 1),
