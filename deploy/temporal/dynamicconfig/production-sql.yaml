@@ -1,0 +1,5 @@
+# 单节点 PostgreSQL 部署只保留必要的稳定动态配置。这里故意不启用官方开发样例中的
+# forceSearchAttributesCacheRefreshOnRead，避免把开发环境的额外数据库压力带入运行服务器。
+limit.maxIDLength:
+  - value: 255
+    constraints: {}

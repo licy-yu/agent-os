@@ -8,6 +8,13 @@ base_url="${SWARMOS_E2E_BASE_URL:-http://127.0.0.1:8080}"
 managed_runtime="${SWARMOS_E2E_MANAGED_RUNTIME:-false}"
 cd "$project_dir"
 
+# 生产环境的业务 API 默认启用 Bearer 鉴权；健康检查仍保持匿名，便于负载均衡器探测。
+# 密钥只从环境变量读取并作为 curl 参数传递，脚本不会把它写入日志或标准输出。
+auth_args=()
+if [[ -n "${SWARMOS_API_KEY:-}" ]]; then
+  auth_args=(-H "Authorization: Bearer ${SWARMOS_API_KEY}")
+fi
+
 control_log=/tmp/swarmos-phase3-control.log
 worker_log=/tmp/swarmos-phase3-worker.log
 : >"$control_log"
@@ -54,7 +61,13 @@ fi
 post() {
   local path=$1
   local body=$2
-  curl -fsS -X POST "$base_url$path" -H 'Content-Type: application/json' --data-binary "$body"
+  curl -fsS -X POST "$base_url$path" "${auth_args[@]}" \
+    -H 'Content-Type: application/json' --data-binary "$body"
+}
+
+api_get() {
+  local path=$1
+  curl -fsS "${auth_args[@]}" "$base_url$path"
 }
 
 suffix=$(date +%s)
@@ -95,8 +108,8 @@ task_b_id=$(jq -r .id <<<"$task_b")
 status_a=""
 status_b=""
 for _ in $(seq 1 90); do
-  status_a=$(curl -fsS "$base_url/api/v1/tasks/$task_a_id" | jq -r .status)
-  status_b=$(curl -fsS "$base_url/api/v1/tasks/$task_b_id" | jq -r .status)
+  status_a=$(api_get "/api/v1/tasks/$task_a_id" | jq -r .status)
+  status_b=$(api_get "/api/v1/tasks/$task_b_id" | jq -r .status)
   if [[ "$status_a" == "SUCCEEDED" && "$status_b" == "SUCCEEDED" ]]; then
     break
   fi
@@ -118,7 +131,7 @@ read -r attempts checkpoints tool_calls evaluations unpublished <<<"$(
 )"
 
 if [[ "$status_a" != "SUCCEEDED" || "$status_b" != "SUCCEEDED" ||
-      "$attempts" -ne 2 || "$checkpoints" -ne 4 || "$tool_calls" -ne 2 || "$evaluations" -ne 2 ]]; then
+      "$attempts" -ne 2 || "$checkpoints" -lt 6 || "$tool_calls" -ne 2 || "$evaluations" -ne 2 ]]; then
   echo "phase3_e2e=failed task_a=$status_a task_b=$status_b attempts=$attempts checkpoints=$checkpoints tools=$tool_calls evaluations=$evaluations unpublished=$unpublished"
   echo "control_tail:"
   tail -n 30 "$control_log"

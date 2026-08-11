@@ -6,6 +6,7 @@
 !bin/
 !bin/control-plane
 !bin/worker
+!bin/workflow-worker
 !configs/
 !configs/config.yaml
 !web/

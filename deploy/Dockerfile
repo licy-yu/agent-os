@@ -9,6 +9,7 @@ RUN apk add --no-cache ca-certificates \
 WORKDIR /app
 COPY --chown=swarmos:swarmos bin/control-plane /app/bin/control-plane
 COPY --chown=swarmos:swarmos bin/worker /app/bin/worker
+COPY --chown=swarmos:swarmos bin/workflow-worker /app/bin/workflow-worker
 COPY --chown=swarmos:swarmos configs/config.yaml /app/configs/config.yaml
 COPY --chown=swarmos:swarmos web/dist /app/web/dist
 

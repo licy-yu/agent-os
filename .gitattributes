@@ -1,9 +1,18 @@
 * text=auto
+.gitattributes text eol=lf
+.env.example text eol=lf
+Dockerfile text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
 *.go text eol=lf
+*.css text eol=lf
+*.json text eol=lf
 *.proto text eol=lf
 *.sql text eol=lf
+*.sh text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
 Makefile text eol=lf
-

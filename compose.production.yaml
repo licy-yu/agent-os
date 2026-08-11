@@ -21,9 +21,115 @@ x-app-security: &app-security
       max-file: "5"
 
 services:
+  # Temporal 使用独立 PostgreSQL。它只加入内部 Docker 网络，不映射宿主机端口，
+  # 因而不会和已有 SwarmOS 业务数据库混用，也不会向局域网暴露数据库。
+  temporal-postgresql:
+    image: public.ecr.aws/docker/library/postgres:16-alpine
+    container_name: swarmos-temporal-postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${SWARMOS_TEMPORAL_DB_PASSWORD:?请在 .env 设置 SWARMOS_TEMPORAL_DB_PASSWORD}
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
+    networks:
+      - temporal-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  # Schema Job 使用 Temporal 官方 admin-tools 执行版本化迁移。脚本可重复运行：
+  # 数据库已存在时继续执行 update-schema，升级 Server 不需要人工改 SQL。
+  temporal-schema:
+    image: temporalio/admin-tools:1.31.2
+    container_name: swarmos-temporal-schema
+    restart: "no"
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${SWARMOS_TEMPORAL_DB_PASSWORD:?请在 .env 设置 SWARMOS_TEMPORAL_DB_PASSWORD}
+      POSTGRES_SEEDS: temporal-postgresql
+      SQL_PASSWORD: ${SWARMOS_TEMPORAL_DB_PASSWORD:?请在 .env 设置 SWARMOS_TEMPORAL_DB_PASSWORD}
+    volumes:
+      - ./deploy/temporal/setup-postgres.sh:/scripts/setup-postgres.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/setup-postgres.sh"]
+    networks:
+      - temporal-internal
+    security_opt:
+      - no-new-privileges:true
+
+  temporal:
+    image: temporalio/server:1.31.2
+    container_name: swarmos-temporal
+    restart: unless-stopped
+    depends_on:
+      temporal-schema:
+        condition: service_completed_successfully
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${SWARMOS_TEMPORAL_DB_PASSWORD:?请在 .env 设置 SWARMOS_TEMPORAL_DB_PASSWORD}
+      POSTGRES_SEEDS: temporal-postgresql
+      BIND_ON_IP: 0.0.0.0
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/production-sql.yaml
+    ports:
+      # Workflow Client/Worker 都使用 host network；只绑定回环地址即可，不向局域网开放。
+      - "127.0.0.1:7233:7233"
+    volumes:
+      - ./deploy/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    networks:
+      - temporal-internal
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  temporal-namespace:
+    image: temporalio/admin-tools:1.31.2
+    container_name: swarmos-temporal-namespace
+    restart: "no"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      DEFAULT_NAMESPACE: default
+      TEMPORAL_NAMESPACE_RETENTION: 30d
+    volumes:
+      - ./deploy/temporal/create-namespace.sh:/scripts/create-namespace.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/create-namespace.sh"]
+    networks:
+      - temporal-internal
+    security_opt:
+      - no-new-privileges:true
+
   control-plane:
     <<: *app-security
-    image: swarmos-app:v0.1.0
+    image: swarmos-app:v1.5.0
     build:
       context: .
       dockerfile: deploy/Dockerfile
@@ -31,10 +137,16 @@ services:
     command: ["/app/bin/control-plane", "-config", "/app/configs/config.yaml"]
     environment:
       # 镜像内路径不能继承宿主机相对路径；其余敏感值继续从 .env 注入。
+      SWARMOS_ENVIRONMENT: production
       SWARMOS_WEB_DIR: /app/web/dist
       SWARMOS_WORKER_METRICS_ADDR: 127.0.0.1:9465
+      SWARMOS_TEMPORAL_ENABLED: "true"
+      SWARMOS_TEMPORAL_ADDRESS: 127.0.0.1:7233
+    depends_on:
+      temporal-namespace:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/readyz"]
       interval: 10s
       timeout: 3s
       retries: 12
@@ -42,11 +154,37 @@ services:
 
   worker:
     <<: *app-security
-    image: swarmos-app:v0.1.0
+    image: swarmos-app:v1.5.0
     container_name: swarmos-worker
     command: ["/app/bin/worker", "-config", "/app/configs/config.yaml"]
     environment:
+      SWARMOS_ENVIRONMENT: production
       SWARMOS_WORKER_METRICS_ADDR: 127.0.0.1:9465
     depends_on:
       control-plane:
         condition: service_healthy
+
+  # Durable Workflow 与普通 Agent Worker 分进程部署。升级/重启模型执行面时，
+  # Temporal Workflow History 仍然保留；Workflow Worker 恢复后会从历史继续重放。
+  workflow-worker:
+    <<: *app-security
+    image: swarmos-app:v1.5.0
+    container_name: swarmos-workflow-worker
+    command: ["/app/bin/workflow-worker", "-config", "/app/configs/config.yaml"]
+    environment:
+      SWARMOS_ENVIRONMENT: production
+      SWARMOS_TEMPORAL_ENABLED: "true"
+      SWARMOS_TEMPORAL_ADDRESS: 127.0.0.1:7233
+      SWARMOS_WORKER_METRICS_ADDR: 127.0.0.1:9466
+    depends_on:
+      temporal-namespace:
+        condition: service_completed_successfully
+
+networks:
+  temporal-internal:
+    name: swarmos-temporal-internal
+    internal: true
+
+volumes:
+  temporal-postgres-data:
+    name: swarmos-temporal-postgres-data
