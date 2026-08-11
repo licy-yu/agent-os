@@ -26,7 +26,9 @@ type schedulerChurnStore struct {
 	value          task.Task
 	candidates     []Candidate
 	transitionCall int
+	bindAttempts   int
 	bindCall       int
+	bindErrors     []error
 	outboxWrites   int
 	decisions      []SchedulerDecision
 
@@ -82,6 +84,12 @@ func (s *schedulerChurnStore) BindTask(_ context.Context, _ uuid.UUID, taskVersi
 	defer s.mu.Unlock()
 	if s.value.Status != task.StatusScheduling || s.value.Version != taskVersion {
 		return fmt.Errorf("%w: bind lost task CAS", domain.ErrConflict)
+	}
+	s.bindAttempts++
+	if len(s.bindErrors) > 0 {
+		err := s.bindErrors[0]
+		s.bindErrors = s.bindErrors[1:]
+		return err
 	}
 	s.value.Status = task.StatusAssigned
 	s.value.Version++
@@ -261,6 +269,68 @@ func TestConcurrentSchedulersLoseCASWithoutCompensatingStateChurn(t *testing.T) 
 	require.Equal(t, 2, leasingState.released, "胜者和 CAS 失败者都必须释放各自短租约")
 	require.Empty(t, leasingState.held)
 	leasingState.mu.Unlock()
+}
+
+// reserveErrorAfterBindConflict 复现生产审计发现的精确故障序列：第一个 Agent 已取得
+// Lease，但 Bind 的 Agent CAS 失败；Scheduler 继续尝试第二个候选时 Redis 返回错误。
+// 此时 Task 已经是 SCHEDULING，错误出口必须先补偿回 READY。
+type reserveErrorAfterBindConflict struct {
+	mu       sync.Mutex
+	calls    int
+	released int
+	err      error
+}
+
+func (m *reserveErrorAfterBindConflict) Reserve(_ context.Context, agentID, taskID uuid.UUID,
+	ttl time.Duration,
+) (*lease.Lease, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	if m.calls == 2 {
+		return nil, false, m.err
+	}
+	return &lease.Lease{AgentID: agentID, TaskID: taskID, Token: "first-candidate", TTL: ttl}, true, nil
+}
+func (m *reserveErrorAfterBindConflict) Release(context.Context, *lease.Lease) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.released++
+	return nil
+}
+
+func TestReserveErrorAfterBindConflictRestoresReady(t *testing.T) {
+	reserveErr := fmt.Errorf("redis reserve unavailable")
+	fixedNow := time.Date(2026, 8, 11, 11, 0, 0, 0, time.UTC)
+	store := &schedulerChurnStore{
+		value: task.Task{
+			ID: uuid.New(), SwarmID: uuid.New(), Status: task.StatusReady, Version: 21,
+			CreatedAt: fixedNow, ExecutionPolicy: task.DefaultExecutionPolicy(),
+		},
+		candidates: []Candidate{schedulableCandidate(), schedulableCandidate()},
+		bindErrors: []error{fmt.Errorf("%w: first agent version changed", domain.ErrConflict)},
+	}
+	leases := &reserveErrorAfterBindConflict{err: reserveErr}
+	scheduler := NewScheduler(store, leases, 30*time.Second, log.NewStdLogger(io.Discard))
+	scheduler.clock = func() time.Time { return fixedNow }
+
+	bound, err := scheduler.ScheduleOnce(context.Background())
+	require.False(t, bound)
+	require.ErrorIs(t, err, reserveErr)
+
+	store.mu.Lock()
+	require.Equal(t, task.StatusReady, store.value.Status)
+	require.Equal(t, int64(23), store.value.Version)
+	require.Equal(t, 2, store.transitionCall,
+		"故障链只能产生 READY→SCHEDULING 与 SCHEDULING→READY 两次有限转换")
+	require.Equal(t, 2, store.outboxWrites)
+	require.Equal(t, 1, store.bindAttempts)
+	require.Zero(t, store.bindCall)
+	store.mu.Unlock()
+	leases.mu.Lock()
+	require.Equal(t, 2, leases.calls)
+	require.Equal(t, 1, leases.released)
+	leases.mu.Unlock()
 }
 
 func schedulableCandidate() Candidate {

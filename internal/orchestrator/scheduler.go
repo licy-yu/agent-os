@@ -34,6 +34,11 @@ var defaultWeights = ScoreWeights{
 	Quality: 0.15, Load: 0.10, Cost: 0.05, Latency: 0.05,
 }
 
+// schedulerCompensationTimeout 独立限制调度补偿写的最长时间。补偿使用 WithoutCancel
+// 脱离原请求取消信号：例如 Redis Reserve 因上游 context 取消而返回错误时，仍要给
+// PostgreSQL 一小段确定的时间把已经声明的 SCHEDULING 恢复成 READY。
+const schedulerCompensationTimeout = 5 * time.Second
+
 // Scheduler 执行 QueueSort -> Filter -> Score -> Reserve -> Bind。
 type Scheduler struct {
 	store       Store
@@ -84,7 +89,11 @@ taskLoop:
 			candidate := &candidates[index]
 			reservation, ok, reserveErr := s.leases.Reserve(ctx, candidate.Instance.ID, value.ID, s.leaseTTL)
 			if reserveErr != nil {
-				return false, fmt.Errorf("为任务 %s Reserve Agent %s: %w", value.ID, candidate.Instance.ID, reserveErr)
+				cause := fmt.Errorf("为任务 %s Reserve Agent %s: %w", value.ID, candidate.Instance.ID, reserveErr)
+				if schedulingClaimed {
+					return false, s.compensateSchedulingFailure(ctx, value, cause)
+				}
+				return false, cause
 			}
 			if !ok {
 				continue
@@ -114,9 +123,12 @@ taskLoop:
 				QueueScore: item.QueueScore, SelectedAgentID: &selectedID, SelectedScore: &selectedScore,
 				Candidates: explanation, Reason: "候选通过硬过滤与评分，并成功取得 Reserve 租约",
 			}); err != nil {
-				_ = s.leases.Release(ctx, reservation)
-				_ = s.restoreReady(ctx, value)
-				return false, fmt.Errorf("记录 Scheduler Explain: %w", err)
+				if releaseErr := s.leases.Release(ctx, reservation); releaseErr != nil {
+					s.logger.Warnf("任务 %s 写入 Explain 失败，且释放 Agent %s 短租约失败: %v",
+						value.ID, candidate.Instance.ID, releaseErr)
+				}
+				cause := fmt.Errorf("记录 Scheduler Explain: %w", err)
+				return false, s.compensateSchedulingFailure(ctx, value, cause)
 			}
 			bindErr := s.store.BindTask(ctx, value.ID, value.Version, candidate.Instance.ID, candidate.Instance.Version)
 			releaseErr := s.leases.Release(ctx, reservation)
@@ -127,8 +139,16 @@ taskLoop:
 				return true, nil
 			}
 			if !errors.Is(bindErr, domain.ErrConflict) {
-				_ = s.restoreReady(ctx, value)
-				return false, fmt.Errorf("绑定 task/agent: %w", bindErr)
+				if releaseErr != nil {
+					s.logger.Warnf("任务 %s Bind 失败，且释放 Agent %s 短租约失败: %v",
+						value.ID, candidate.Instance.ID, releaseErr)
+				}
+				cause := fmt.Errorf("绑定 task/agent: %w", bindErr)
+				return false, s.compensateSchedulingFailure(ctx, value, cause)
+			}
+			if releaseErr != nil {
+				s.logger.Warnf("任务 %s Bind CAS 竞争失败，且释放 Agent %s 短租约失败: %v",
+					value.ID, candidate.Instance.ID, releaseErr)
 			}
 		}
 		reason := "候选通过过滤，但 Reserve 租约均被其他调度器占用"
@@ -144,7 +164,8 @@ taskLoop:
 			QueueScore: item.QueueScore, Candidates: explanation, Reason: reason,
 		}); err != nil {
 			if schedulingClaimed {
-				_ = s.restoreReady(ctx, value)
+				return false, s.compensateSchedulingFailure(ctx, value,
+					fmt.Errorf("记录未调度原因: %w", err))
 			}
 			return false, fmt.Errorf("记录未调度原因: %w", err)
 		}
@@ -152,7 +173,7 @@ taskLoop:
 		// 只有已经成功声明 SCHEDULING、随后却在 Bind CAS 中失利的任务才需要补偿回
 		// READY。单纯无候选/租约占用时从未离开 READY，因此这里绝不能做“恢复”写入。
 		if schedulingClaimed {
-			if err := s.restoreReady(ctx, value); err != nil && !errors.Is(err, domain.ErrConflict) {
+			if err := s.restoreClaimedTask(ctx, value); err != nil {
 				return false, err
 			}
 		}
@@ -163,6 +184,28 @@ taskLoop:
 func (s *Scheduler) restoreReady(ctx context.Context, value *task.Task) error {
 	_, err := transition(ctx, s.store, value, task.ActorScheduler, task.StatusReady)
 	return err
+}
+
+// compensateSchedulingFailure 是所有“已声明 SCHEDULING 后异常退出”路径的统一出口。
+// 原始错误决定本轮为何失败，恢复错误决定 Task 是否可能滞留；二者都对运维有意义，
+// 因此补偿失败时用 errors.Join 同时返回，绝不再用 `_ = restoreReady(...)` 静默吞错。
+func (s *Scheduler) compensateSchedulingFailure(ctx context.Context, value *task.Task, cause error) error {
+	if err := s.restoreClaimedTask(ctx, value); err != nil {
+		s.logger.Errorf("调度失败后的状态补偿也失败: cause=%v compensation=%v", cause, err)
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+// restoreClaimedTask 给所有 SCHEDULING 补偿统一提供脱离上游取消信号的短超时上下文。
+// 这样异常分支与“所有 Bind CAS 均失败”的正常收尾使用完全相同的恢复可靠性约束。
+func (s *Scheduler) restoreClaimedTask(ctx context.Context, value *task.Task) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), schedulerCompensationTimeout)
+	defer cancel()
+	if err := s.restoreReady(restoreCtx, value); err != nil {
+		return fmt.Errorf("任务 %s 从 SCHEDULING 补偿恢复 READY: %w", value.ID, err)
+	}
+	return nil
 }
 
 // SortQueue 根据业务优先级、等待时间、阻塞下游数量和 deadline 紧迫度排序。

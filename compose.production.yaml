@@ -134,8 +134,8 @@ services:
 
   control-plane:
     <<: *app-security
-    # 生产修订版包含 Temporal 宿主网络发布与 Completion Manifest JSON 指标修复。
-    image: swarmos-app:v1.5.2
+    # 生产修订版包含 Temporal 网络、Manifest 读模型与 Scheduler 故障补偿修复。
+    image: swarmos-app:v1.5.3
     build:
       context: .
       dockerfile: deploy/Dockerfile
@@ -160,7 +160,7 @@ services:
 
   worker:
     <<: *app-security
-    image: swarmos-app:v1.5.2
+    image: swarmos-app:v1.5.3
     container_name: swarmos-worker
     command: ["/app/bin/worker", "-config", "/app/configs/config.yaml"]
     environment:
@@ -174,7 +174,7 @@ services:
   # Temporal Workflow History 仍然保留；Workflow Worker 恢复后会从历史继续重放。
   workflow-worker:
     <<: *app-security
-    image: swarmos-app:v1.5.2
+    image: swarmos-app:v1.5.3
     container_name: swarmos-workflow-worker
     command: ["/app/bin/workflow-worker", "-config", "/app/configs/config.yaml"]
     environment:
