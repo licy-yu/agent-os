@@ -62,6 +62,8 @@ type Store interface {
 	ListQueuedTasks(context.Context, int) ([]QueuedTask, error)
 	ListSchedulerCandidates(context.Context, uuid.UUID, int64) ([]Candidate, error)
 	BindTask(context.Context, uuid.UUID, int64, uuid.UUID, int64) error
+	// RecordSchedulerDecision 对未选中决策按 Task 版本幂等合并；Scheduler 可以在
+	// READY 轮询中持续提供最新 Explain，而不会把“仍然无候选”放大成无限审计写入。
 	RecordSchedulerDecision(context.Context, SchedulerDecision) error
 }
 

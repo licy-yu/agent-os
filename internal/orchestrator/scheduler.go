@@ -61,33 +61,53 @@ func (s *Scheduler) ScheduleOnce(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("读取 READY 队列: %w", err)
 	}
 	SortQueue(queued, s.clock())
+
+	// taskLoop 标签用于处理多副本 Scheduler 的正常 CAS 竞争：当前快照一旦过期，必须
+	// 立即释放已经取得的 Redis 短租约并处理下一项，不能继续拿旧快照尝试其他 Agent。
+taskLoop:
 	for _, item := range queued {
 		value := item.Task
-		if _, err := transition(ctx, s.store, value, task.ActorScheduler, task.StatusScheduling); err != nil {
-			if errors.Is(err, domain.ErrConflict) {
-				continue
-			}
-			return false, err
-		}
 
+		// 候选查询、硬过滤、评分和 Redis Reserve 都是“观察/短租约”操作。此时 Task
+		// 必须继续保持 READY：没有 Agent 或所有租约都被占用并不是领域状态变化，如果
+		// 先写成 SCHEDULING 再恢复 READY，1 秒一次的调度循环会无限增加 version、
+		// Timeline 和 Outbox。只有真正拿到某个 Agent 的短租约后，才进入持久化状态机。
 		candidates, err := s.store.ListSchedulerCandidates(ctx, value.SwarmID, value.ExecutionPolicy.MaxTokens)
 		if err != nil {
-			_ = s.restoreReady(ctx, value)
 			return false, fmt.Errorf("查询任务 %s 候选 Agent: %w", value.ID, err)
 		}
 		candidates, explanation := ExplainCandidates(value, candidates)
 		ScoreCandidates(value, candidates, defaultWeights)
 		applyCandidateScores(explanation, candidates)
+		schedulingClaimed := false
 		for index := range candidates {
 			candidate := &candidates[index]
 			reservation, ok, reserveErr := s.leases.Reserve(ctx, candidate.Instance.ID, value.ID, s.leaseTTL)
 			if reserveErr != nil {
-				_ = s.restoreReady(ctx, value)
-				return false, reserveErr
+				return false, fmt.Errorf("为任务 %s Reserve Agent %s: %w", value.ID, candidate.Instance.ID, reserveErr)
 			}
 			if !ok {
 				continue
 			}
+
+			if !schedulingClaimed {
+				// Redis Lease 只减少竞争，数据库 CAS 才是 Task 所有权的最终事实。两个
+				// Scheduler 可能分别租到不同 Agent，但只有一个能把同一 READY 版本推进
+				// 到 SCHEDULING；失败者释放自己的 Lease 即可，不产生补偿状态写入。
+				if _, err := transition(ctx, s.store, value, task.ActorScheduler, task.StatusScheduling); err != nil {
+					releaseErr := s.leases.Release(ctx, reservation)
+					if releaseErr != nil {
+						s.logger.Warnf("任务 %s 的调度 CAS 失败，且释放 Agent %s 短租约失败: %v",
+							value.ID, candidate.Instance.ID, releaseErr)
+					}
+					if errors.Is(err, domain.ErrConflict) {
+						continue taskLoop
+					}
+					return false, err
+				}
+				schedulingClaimed = true
+			}
+
 			selectedID, selectedScore := candidate.Instance.ID, candidate.FinalScore
 			if err := s.store.RecordSchedulerDecision(ctx, SchedulerDecision{
 				SchedulerID: s.schedulerID, TaskID: value.ID, TaskVersion: value.Version,
@@ -112,20 +132,29 @@ func (s *Scheduler) ScheduleOnce(ctx context.Context) (bool, error) {
 			}
 		}
 		reason := "候选通过过滤，但 Reserve 租约均被其他调度器占用"
-		if len(candidates) == 0 {
+		if len(explanation) == 0 {
+			reason = "当前没有已注册的 Agent 候选"
+		} else if len(candidates) == 0 {
 			reason = "所有候选均未通过 Task Contract 硬条件"
+		} else if schedulingClaimed {
+			reason = "候选取得租约，但 Bind CAS 竞争失败"
 		}
 		if err := s.store.RecordSchedulerDecision(ctx, SchedulerDecision{
 			SchedulerID: s.schedulerID, TaskID: value.ID, TaskVersion: value.Version,
 			QueueScore: item.QueueScore, Candidates: explanation, Reason: reason,
 		}); err != nil {
-			_ = s.restoreReady(ctx, value)
+			if schedulingClaimed {
+				_ = s.restoreReady(ctx, value)
+			}
 			return false, fmt.Errorf("记录未调度原因: %w", err)
 		}
 
-		// 没有可用 Agent 时恢复 READY；它会在下一轮等待新心跳或实例释放。
-		if err := s.restoreReady(ctx, value); err != nil && !errors.Is(err, domain.ErrConflict) {
-			return false, err
+		// 只有已经成功声明 SCHEDULING、随后却在 Bind CAS 中失利的任务才需要补偿回
+		// READY。单纯无候选/租约占用时从未离开 READY，因此这里绝不能做“恢复”写入。
+		if schedulingClaimed {
+			if err := s.restoreReady(ctx, value); err != nil && !errors.Is(err, domain.ErrConflict) {
+				return false, err
+			}
 		}
 	}
 	return false, nil

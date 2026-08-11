@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -231,6 +232,11 @@ func (r *Repository) ListSchedulerCandidates(ctx context.Context, swarmID uuid.U
 
 // RecordSchedulerDecision 保存完整 Filter/Score 证据。task_id 反查 tenant/run，调用方不能
 // 通过请求体伪造租户归属。
+//
+// “未选中 Agent”是 READY Task 在某一版本上的当前调度解释，而不是每秒都发生一次的
+// 领域事件。因此同一 task_id + task_version 最多保留一条未选中记录：证据不变时零写入，
+// 候选集合或拒绝原因变化时原地刷新。成功选中的决策仍逐次追加，完整保留真正的 Reserve/
+// Bind 审计轨迹。这个约束在仓储事务中实现，不依赖单进程内存，能覆盖多副本 Scheduler。
 func (r *Repository) RecordSchedulerDecision(ctx context.Context, decision orchestrator.SchedulerDecision) error {
 	candidatesRaw, err := marshalJSON(decision.Candidates, "scheduler.candidates")
 	if err != nil {
@@ -246,22 +252,67 @@ func (r *Repository) RecordSchedulerDecision(ctx context.Context, decision orche
 	if err != nil {
 		return err
 	}
-	command, err := r.pool.Exec(ctx, `
-		INSERT INTO scheduler_decisions(
-			id,tenant_id,run_id,task_id,scheduler_id,task_version,queue_score,
-			selected_agent_id,selected_score,candidates,filters,reason
-		)
-		SELECT $2,t.tenant_id,t.swarm_id,t.id,$3,$4,$5,$6,$7,$8,$9,$10
-		FROM tasks t WHERE t.id=$1`, decision.TaskID, uuid.New(), decision.SchedulerID,
-		decision.TaskVersion, decision.QueueScore, decision.SelectedAgentID, decision.SelectedScore,
-		candidatesRaw, filtersRaw, decision.Reason)
-	if err != nil {
-		return mapWriteError("写入 Scheduler Explain", err)
-	}
-	if command.RowsAffected() != 1 {
-		return fmt.Errorf("%w: scheduler task %s", domain.ErrNotFound, decision.TaskID)
-	}
-	return nil
+	decisionID := uuid.New()
+	return r.withTx(ctx, func(tx pgx.Tx) error {
+		if decision.SelectedAgentID == nil {
+			// PostgreSQL advisory transaction lock 以 Task UUID 的稳定哈希作为锁键。
+			// 它只串行同一 Task 的 Explain 合并，不会阻塞其他 Task；事务结束自动释放，
+			// 即使 Scheduler 进程崩溃也不会遗留锁。仅靠 SELECT ... FOR UPDATE 无法保护
+			// “尚无记录”这一空集合，两个副本首次写入时仍可能各插一行。
+			if _, err := tx.Exec(ctx, `
+				SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))`,
+				decision.TaskID.String()); err != nil {
+				return fmt.Errorf("锁定 Scheduler Explain 合并键: %w", err)
+			}
+
+			var existingID uuid.UUID
+			err := tx.QueryRow(ctx, `
+				SELECT id
+				FROM scheduler_decisions
+				WHERE task_id=$1 AND task_version=$2 AND selected_agent_id IS NULL
+				ORDER BY created_at DESC,id DESC
+				LIMIT 1
+				FOR UPDATE`, decision.TaskID, decision.TaskVersion).Scan(&existingID)
+			switch {
+			case err == nil:
+				// QueueScore 会随等待时间连续变化，不能把它作为去重条件，否则即使候选
+				// 完全不变仍会每秒产生一次 MVCC/WAL 写入。只有候选证据或结论变化才
+				// 刷新整行，此时顺便记录最新分数和实际观察到变化的 Scheduler。
+				_, updateErr := tx.Exec(ctx, `
+					UPDATE scheduler_decisions
+					SET scheduler_id=$2,queue_score=$3,candidates=$4::jsonb,
+					    filters=$5::jsonb,reason=$6,created_at=now()
+					WHERE id=$1
+					  AND (candidates,filters,reason) IS DISTINCT FROM
+					      ($4::jsonb,$5::jsonb,$6::text)`,
+					existingID, decision.SchedulerID, decision.QueueScore,
+					candidatesRaw, filtersRaw, decision.Reason)
+				if updateErr != nil {
+					return mapWriteError("合并 Scheduler Explain", updateErr)
+				}
+				return nil
+			case !errors.Is(err, pgx.ErrNoRows):
+				return fmt.Errorf("查询待合并 Scheduler Explain: %w", err)
+			}
+		}
+
+		command, err := tx.Exec(ctx, `
+			INSERT INTO scheduler_decisions(
+				id,tenant_id,run_id,task_id,scheduler_id,task_version,queue_score,
+				selected_agent_id,selected_score,candidates,filters,reason
+			)
+			SELECT $2,t.tenant_id,t.swarm_id,t.id,$3,$4,$5,$6,$7,$8,$9,$10
+			FROM tasks t WHERE t.id=$1`, decision.TaskID, decisionID, decision.SchedulerID,
+			decision.TaskVersion, decision.QueueScore, decision.SelectedAgentID, decision.SelectedScore,
+			candidatesRaw, filtersRaw, decision.Reason)
+		if err != nil {
+			return mapWriteError("写入 Scheduler Explain", err)
+		}
+		if command.RowsAffected() != 1 {
+			return fmt.Errorf("%w: scheduler task %s", domain.ErrNotFound, decision.TaskID)
+		}
+		return nil
+	})
 }
 
 // BindTask 原子地把 Task 和 Agent 互相绑定；任一 CAS 失败都会整体回滚。
