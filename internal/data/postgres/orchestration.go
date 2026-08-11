@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -14,16 +15,19 @@ import (
 	"github.com/licy-yu/agent-os/internal/orchestrator"
 )
 
-// ListReconcileTasks 只读取 Controller 有权处理的非终态任务。
-func (r *Repository) ListReconcileTasks(ctx context.Context, limit int) ([]*task.Task, error) {
+// ListReconcileTasks 读取 Controller 有权处理的非终态任务。SCHEDULING 必须先按
+// updated_at 截止时间过滤再做 LIMIT；否则大量正在正常 Bind 的新鲜任务会占满批次，
+// 让真正因 Scheduler SIGKILL 遗留的孤儿状态永远得不到恢复。
+func (r *Repository) ListReconcileTasks(ctx context.Context, staleSchedulingBefore time.Time, limit int) ([]*task.Task, error) {
 	rows, err := r.pool.Query(ctx, taskSelect+`
 		JOIN swarms run_scope ON run_scope.id=t.swarm_id
-		WHERE t.status IN ('CREATED','PLANNING','BLOCKED','RETRY_WAIT')
+		WHERE (t.status IN ('CREATED','PLANNING','BLOCKED','RETRY_WAIT')
+		       OR (t.status='SCHEDULING' AND t.updated_at <= $1))
 		  AND t.tenant_id=run_scope.tenant_id
 		  AND run_scope.desired_state='RUNNING'
 		  AND run_scope.status IN ('PENDING','RUNNING')
 		ORDER BY t.updated_at,t.id
-		LIMIT $1`, limit)
+		LIMIT $2`, staleSchedulingBefore, limit)
 	if err != nil {
 		return nil, fmt.Errorf("列出 reconcile tasks: %w", err)
 	}

@@ -54,7 +54,10 @@ type SchedulerDecision struct {
 
 // Store 聚合 Controller/Scheduler 所需的原子数据库操作。
 type Store interface {
-	ListReconcileTasks(context.Context, int) ([]*task.Task, error)
+	// ListReconcileTasks 除常规 Controller 状态外，只返回 updated_at 不晚于
+	// staleSchedulingBefore 的 SCHEDULING；必须在 SQL 的 LIMIT 前过滤，避免新鲜任务
+	// 占满批次并让真正的孤儿状态饥饿。
+	ListReconcileTasks(context.Context, time.Time, int) ([]*task.Task, error)
 	DependenciesSatisfied(context.Context, uuid.UUID) (bool, error)
 	TransitionTask(context.Context, uuid.UUID, int64, task.Status, task.Status, string) (int64, error)
 	ActivateRegisteredAgents(context.Context, int) (int, error)

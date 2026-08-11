@@ -17,7 +17,12 @@ PG_USER="${SWARMOS_PG_USER:-app}"
 PG_DATABASE="${SWARMOS_PG_DATABASE:-swarmos}"
 OBSERVE_SECONDS="${SWARMOS_SCHEDULER_OBSERVE_SECONDS:-10}"
 
-for command_name in curl jq docker sed cut; do
+if [[ ! "${OBSERVE_SECONDS}" =~ ^[0-9]+$ || "${OBSERVE_SECONDS}" -lt 5 ]]; then
+  echo "SWARMOS_SCHEDULER_OBSERVE_SECONDS 必须是大于等于 5 的整数秒" >&2
+  exit 1
+fi
+
+for command_name in curl jq docker sed cut mktemp; do
   command -v "${command_name}" >/dev/null 2>&1 || {
     echo "缺少命令: ${command_name}" >&2
     exit 1
@@ -36,16 +41,27 @@ if [[ ${#SWARMOS_API_KEY} -lt 32 ]]; then
   exit 1
 fi
 
+# 不把 Bearer 值放进 curl 的 argv；同机其他用户可能通过 ps 或 /proc 看到进程参数。
+# Header 只写入 mktemp 创建的 0600 文件，curl argv 中仅出现文件名，退出时精确删除。
+auth_header_file="$(mktemp "${TMPDIR:-/tmp}/swarmos-scheduler-smoke.XXXXXX")"
+chmod 600 "${auth_header_file}"
+cleanup() {
+  rm -f -- "${auth_header_file}"
+}
+trap cleanup EXIT
+printf 'Authorization: Bearer %s\n' "${SWARMOS_API_KEY}" >"${auth_header_file}"
+unset SWARMOS_API_KEY
+
 api_get() {
-  curl -fsS \
-    -H "Authorization: Bearer ${SWARMOS_API_KEY}" \
+  curl -fsS --connect-timeout 5 --max-time 30 \
+    -H "@${auth_header_file}" \
     "${BASE_URL}$1"
 }
 
 api_post() {
   local path="$1"
-  curl -fsS -X POST \
-    -H "Authorization: Bearer ${SWARMOS_API_KEY}" \
+  curl -fsS --connect-timeout 5 --max-time 30 -X POST \
+    -H "@${auth_header_file}" \
     -H 'Content-Type: application/json' \
     --data-binary @- \
     "${BASE_URL}${path}"
@@ -64,7 +80,7 @@ if [[ ! "${template_id}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
 fi
 
 run_json="$(jq -nc '{
-  name:"v1.5.2 Scheduler 空转验收",
+  name:"v1.5.4 Scheduler 空转验收",
   goal:"验证无 Agent 时 READY Task 不增加版本和 Outbox，注册 Agent 后正常完成",
   budgetTokens:300000,
   budgetCostMicros:5000000,
@@ -97,8 +113,13 @@ fi
 
 # 先等第一条未选中 Explain 出现，再取基线；这样不会把一次合法的首次审计插入误判为
 # 写放大。热修后，相同 task_id + task_version 的未选中 Explain 会在数据库中幂等合并。
+version_before="$(query_db "SELECT version FROM tasks WHERE id='${task_id}'::uuid")"
 for _ in $(seq 1 10); do
-  explain_count="$(query_db "SELECT count(*) FROM scheduler_decisions WHERE task_id='${task_id}'::uuid")"
+  explain_count="$(query_db "
+    SELECT count(*) FROM scheduler_decisions
+    WHERE task_id='${task_id}'::uuid
+      AND task_version=${version_before}
+      AND selected_agent_id IS NULL")"
   [[ "${explain_count}" -ge 1 ]] && break
   sleep 1
 done
@@ -107,30 +128,45 @@ if [[ "${explain_count:-0}" -lt 1 ]]; then
   exit 1
 fi
 
-version_before="$(query_db "SELECT version FROM tasks WHERE id='${task_id}'::uuid")"
 outbox_before="$(query_db "SELECT count(*) FROM event_outbox WHERE aggregate_type='task' AND aggregate_id='${task_id}'::uuid")"
-explain_before="$(query_db "SELECT count(*) FROM scheduler_decisions WHERE task_id='${task_id}'::uuid")"
+explain_before="${explain_count}"
 # count 只能证明没有新增行，无法识别同一行是否每秒 UPDATE。把 PostgreSQL xmin、
 # created_at 和证据内容摘要一起纳入快照，可以捕捉任何 MVCC 行版本变化与内容变化。
 explain_snapshot_before="$(query_db "
   SELECT id::text || '|' || xmin::text || '|' || created_at::text || '|' ||
          md5(candidates::text || '|' || filters::text || '|' || reason)
   FROM scheduler_decisions
-  WHERE task_id='${task_id}'::uuid AND selected_agent_id IS NULL
+  WHERE task_id='${task_id}'::uuid
+    AND task_version=${version_before}
+    AND selected_agent_id IS NULL
   ORDER BY created_at DESC,id DESC LIMIT 1")"
+if [[ -z "${explain_snapshot_before}" ]]; then
+  echo "Scheduler Explain 基线为空" >&2
+  exit 1
+fi
 
 sleep "${OBSERVE_SECONDS}"
 
 status_after="$(query_db "SELECT status FROM tasks WHERE id='${task_id}'::uuid")"
 version_after="$(query_db "SELECT version FROM tasks WHERE id='${task_id}'::uuid")"
 outbox_after="$(query_db "SELECT count(*) FROM event_outbox WHERE aggregate_type='task' AND aggregate_id='${task_id}'::uuid")"
-explain_after="$(query_db "SELECT count(*) FROM scheduler_decisions WHERE task_id='${task_id}'::uuid")"
+explain_after="$(query_db "
+  SELECT count(*) FROM scheduler_decisions
+  WHERE task_id='${task_id}'::uuid
+    AND task_version=${version_before}
+    AND selected_agent_id IS NULL")"
 explain_snapshot_after="$(query_db "
   SELECT id::text || '|' || xmin::text || '|' || created_at::text || '|' ||
          md5(candidates::text || '|' || filters::text || '|' || reason)
   FROM scheduler_decisions
-  WHERE task_id='${task_id}'::uuid AND selected_agent_id IS NULL
+  WHERE task_id='${task_id}'::uuid
+    AND task_version=${version_before}
+    AND selected_agent_id IS NULL
   ORDER BY created_at DESC,id DESC LIMIT 1")"
+if [[ -z "${explain_snapshot_after}" ]]; then
+  echo "Scheduler Explain 观察后快照为空" >&2
+  exit 1
+fi
 
 [[ "${status_after}" == 'READY' ]]
 [[ "${version_after}" == "${version_before}" ]]
@@ -144,7 +180,7 @@ printf 'idle_window_seconds=%s task_version=%s task_outbox=%s scheduler_explain=
 agent_json="$(jq -nc \
   --arg templateId "${template_id}" \
   --arg swarmId "${run_id}" \
-  '{templateId:$templateId,swarmId:$swarmId,name:"v1.5.2-scheduler-smoke-agent"}' \
+  '{templateId:$templateId,swarmId:$swarmId,name:"v1.5.4-scheduler-smoke-agent"}' \
   | api_post '/api/v1/agents')"
 agent_id="$(jq -er '.id' <<<"${agent_json}")"
 [[ "${agent_id}" =~ ^[0-9a-fA-F-]{36}$ ]]
@@ -166,8 +202,8 @@ if [[ ! "${manifest_id}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
   echo "Run 已完成，但没有合法 Completion Manifest ID" >&2
   exit 1
 fi
-manifest_http="$(curl -sS -o /dev/null -w '%{http_code}' \
-  -H "Authorization: Bearer ${SWARMOS_API_KEY}" \
+manifest_http="$(curl -sS --connect-timeout 5 --max-time 30 -o /dev/null -w '%{http_code}' \
+  -H "@${auth_header_file}" \
   "${BASE_URL}/api/v1/completion-manifests/${manifest_id}")"
 if [[ "${manifest_http}" != '200' ]]; then
   echo "Completion Manifest 读取失败，HTTP=${manifest_http}" >&2

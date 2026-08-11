@@ -13,21 +13,52 @@ import (
 
 // TaskController 观察数据库中的非终态 Task，并把实际状态拉向期望状态。
 type TaskController struct {
-	store  Store
-	batch  int
-	logger *log.Helper
+	store             Store
+	batch             int
+	clock             Clock
+	schedulingTimeout time.Duration
+	logger            *log.Helper
 }
 
-func NewTaskController(store Store, logger log.Logger) *TaskController {
+// MinSchedulingRecoveryTimeout 给正常的 Reserve→Bind 短事务保留足够余量。默认 Lease
+// 为 30 秒时，2 倍恰好也是 1 分钟；若运维缩短 Lease，恢复阈值仍不会激进到抢占 Bind。
+const MinSchedulingRecoveryTimeout = time.Minute
+
+// SchedulingRecoveryTimeout 始终明显大于 Redis Lease TTL。Redis Lease 过期后才允许
+// Controller 回收 SCHEDULING，即使原 Scheduler 长暂停后恢复，它的 Bind 也会被数据库
+// status+version CAS 拒绝，不会形成双重分配。
+func SchedulingRecoveryTimeout(leaseTTL time.Duration) time.Duration {
+	if leaseTTL <= 0 {
+		return MinSchedulingRecoveryTimeout
+	}
+	// 防止异常配置在乘二时溢出为负数；正常配置只会走下面的 2*leaseTTL。
+	const maxDuration = time.Duration(1<<63 - 1)
+	if leaseTTL > maxDuration/2 {
+		return maxDuration
+	}
+	timeout := 2 * leaseTTL
+	if timeout < MinSchedulingRecoveryTimeout {
+		return MinSchedulingRecoveryTimeout
+	}
+	return timeout
+}
+
+func NewTaskController(store Store, schedulingTimeout time.Duration, logger log.Logger) *TaskController {
+	if schedulingTimeout <= 0 {
+		schedulingTimeout = MinSchedulingRecoveryTimeout
+	}
 	return &TaskController{
-		store: store, batch: 100,
+		store: store, batch: 100, schedulingTimeout: schedulingTimeout,
+		clock:  func() time.Time { return time.Now().UTC() },
 		logger: log.NewHelper(log.With(logger, "component", "task-controller")),
 	}
 }
 
 // ReconcileOnce 每次只推进一个合法状态边；这样每次变更都有独立版本和事件，便于审计与恢复。
 func (c *TaskController) ReconcileOnce(ctx context.Context) (int, error) {
-	items, err := c.store.ListReconcileTasks(ctx, c.batch)
+	now := c.clock()
+	staleSchedulingBefore := now.Add(-c.schedulingTimeout)
+	items, err := c.store.ListReconcileTasks(ctx, staleSchedulingBefore, c.batch)
 	if err != nil {
 		return 0, fmt.Errorf("列出待协调任务: %w", err)
 	}
@@ -60,7 +91,14 @@ func (c *TaskController) ReconcileOnce(ctx context.Context) (int, error) {
 			actor, next = task.ActorController, task.StatusReady
 		case task.StatusRetryWait:
 			// available_at 是 Reviewer/Recovery 计算好的退避边界。
-			if value.AvailableAt.After(c.now()) {
+			if value.AvailableAt.After(now) {
+				continue
+			}
+			actor, next = task.ActorController, task.StatusReady
+		case task.StatusScheduling:
+			// PostgreSQL 查询已经做过时间过滤；这里再次防御，保证测试仓储或未来
+			// Store 实现即使错误返回新鲜 SCHEDULING，也不能提前抢占正在进行的 Bind。
+			if value.UpdatedAt.After(staleSchedulingBefore) {
 				continue
 			}
 			actor, next = task.ActorController, task.StatusReady
@@ -79,9 +117,6 @@ func (c *TaskController) ReconcileOnce(ctx context.Context) (int, error) {
 	}
 	return changed, nil
 }
-
-// now 单独保留方法，后续可直接替换为注入时钟；当前统一使用 UTC。
-func (c *TaskController) now() time.Time { return time.Now().UTC() }
 
 // AgentController 将完成注册的实例推进到 IDLE，交给 Scheduler 使用。
 type AgentController struct {

@@ -107,7 +107,9 @@ func main() {
 	httpServer := server.NewHTTPServer(cfg.Server, cfg.Security, svc, runSvc, safetySvc, consoleSvc,
 		server.NewReadinessProbe(dependencyProbes...), telemetry, logger)
 	grpcServer := server.NewGRPCServer(cfg.Server, svc, telemetry, logger)
-	taskController := orchestrator.NewTaskController(repository, logger)
+	taskController := orchestrator.NewTaskController(
+		repository, orchestrator.SchedulingRecoveryTimeout(cfg.Runtime.LeaseTTL), logger,
+	)
 	agentController := orchestrator.NewAgentController(repository)
 	scheduler := orchestrator.NewScheduler(repository, leaseManager, cfg.Runtime.LeaseTTL, logger)
 	reviewer := orchestrator.NewReviewerController(repository)

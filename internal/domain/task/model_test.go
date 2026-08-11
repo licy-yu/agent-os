@@ -33,3 +33,13 @@ func TestDefaultExecutionPolicyHasLoopFuses(t *testing.T) {
 	require.Equal(t, 30*time.Minute, policy.Timeout())
 	require.Greater(t, policy.MaxTokens, int64(0))
 }
+
+func TestControllerMayOnlyRecoverSchedulingToReady(t *testing.T) {
+	t.Parallel()
+	value := Task{ID: uuid.New(), Status: StatusScheduling}
+
+	// 该权限仅供超时判断后的 Controller 使用；状态机允许恢复 READY，但不能让
+	// Controller 冒充 Scheduler 完成 ASSIGNED，最终所有权仍由 Bind CAS 决定。
+	require.Error(t, value.Transition(ActorController, StatusAssigned))
+	require.NoError(t, value.Transition(ActorController, StatusReady))
+}

@@ -21,7 +21,7 @@ type cycleStore struct {
 	decisions []SchedulerDecision
 }
 
-func (s *cycleStore) ListReconcileTasks(context.Context, int) ([]*task.Task, error) {
+func (s *cycleStore) ListReconcileTasks(context.Context, time.Time, int) ([]*task.Task, error) {
 	return []*task.Task{s.task}, nil
 }
 func (s *cycleStore) DependenciesSatisfied(context.Context, uuid.UUID) (bool, error) {
@@ -77,7 +77,7 @@ func TestControllerAndSchedulerCycle(t *testing.T) {
 		BudgetAllowed: true, HistorySuccess: .5, ContextAffinity: 1, QualityScore: .5, LatencyScore: .5,
 	}}
 	logger := log.NewStdLogger(nil)
-	controller := NewTaskController(store, logger)
+	controller := NewTaskController(store, time.Minute, logger)
 
 	changed, err := controller.ReconcileOnce(context.Background())
 	require.NoError(t, err)

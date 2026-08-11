@@ -36,7 +36,7 @@ type schedulerChurnStore struct {
 	proceed chan struct{}
 }
 
-func (s *schedulerChurnStore) ListReconcileTasks(context.Context, int) ([]*task.Task, error) {
+func (s *schedulerChurnStore) ListReconcileTasks(context.Context, time.Time, int) ([]*task.Task, error) {
 	return nil, nil
 }
 func (s *schedulerChurnStore) DependenciesSatisfied(context.Context, uuid.UUID) (bool, error) {
@@ -331,6 +331,112 @@ func TestReserveErrorAfterBindConflictRestoresReady(t *testing.T) {
 	require.Equal(t, 2, leases.calls)
 	require.Equal(t, 1, leases.released)
 	leases.mu.Unlock()
+}
+
+// staleSchedulingStore 在 SQL 仓储之外再次模拟“先按 updated_at 过滤、再返回快照”。
+// barrier 可让两个 Controller 必定读到同一个陈旧版本，从而确定性验证多副本 CAS。
+type staleSchedulingStore struct {
+	*schedulerChurnStore
+	listed  chan struct{}
+	proceed chan struct{}
+}
+
+func (s *staleSchedulingStore) ListReconcileTasks(_ context.Context, staleBefore time.Time,
+	_ int,
+) ([]*task.Task, error) {
+	s.mu.Lock()
+	value := s.value
+	s.mu.Unlock()
+	if value.Status != task.StatusScheduling || value.UpdatedAt.After(staleBefore) {
+		return nil, nil
+	}
+	if s.listed != nil {
+		s.listed <- struct{}{}
+		<-s.proceed
+	}
+	return []*task.Task{&value}, nil
+}
+
+func TestStaleSchedulingRecoveryUsesInjectedClockBoundary(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store := &staleSchedulingStore{schedulerChurnStore: &schedulerChurnStore{
+		value: task.Task{
+			ID: uuid.New(), SwarmID: uuid.New(), Status: task.StatusScheduling, Version: 31,
+			UpdatedAt: fixedNow.Add(-59 * time.Second), ExecutionPolicy: task.DefaultExecutionPolicy(),
+		},
+	}}
+	controller := NewTaskController(store, time.Minute, log.NewStdLogger(io.Discard))
+	now := fixedNow
+	controller.clock = func() time.Time { return now }
+
+	changed, err := controller.ReconcileOnce(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, changed, "未超过恢复阈值的 SCHEDULING 不能抢占正常 Bind")
+
+	// 不 sleep，只推进注入时钟越过边界；下一轮应通过 Controller CAS 写回 READY。
+	now = now.Add(2 * time.Second)
+	changed, err = controller.ReconcileOnce(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, changed)
+	store.mu.Lock()
+	require.Equal(t, task.StatusReady, store.value.Status)
+	require.Equal(t, int64(32), store.value.Version)
+	require.Equal(t, 1, store.transitionCall)
+	require.Equal(t, 1, store.outboxWrites, "恢复必须沿用 TransitionTask 产生 task.ready Outbox")
+	store.mu.Unlock()
+}
+
+func TestConcurrentControllersRecoverStaleSchedulingOnce(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 11, 13, 0, 0, 0, time.UTC)
+	store := &staleSchedulingStore{
+		schedulerChurnStore: &schedulerChurnStore{value: task.Task{
+			ID: uuid.New(), SwarmID: uuid.New(), Status: task.StatusScheduling, Version: 41,
+			UpdatedAt: fixedNow.Add(-2 * time.Minute), ExecutionPolicy: task.DefaultExecutionPolicy(),
+		}},
+		listed: make(chan struct{}, 2), proceed: make(chan struct{}),
+	}
+	controllers := []*TaskController{
+		NewTaskController(store, time.Minute, log.NewStdLogger(io.Discard)),
+		NewTaskController(store, time.Minute, log.NewStdLogger(io.Discard)),
+	}
+	for _, controller := range controllers {
+		controller.clock = func() time.Time { return fixedNow }
+	}
+	results := make(chan struct {
+		changed int
+		err     error
+	}, 2)
+	for _, controller := range controllers {
+		go func(value *TaskController) {
+			changed, err := value.ReconcileOnce(context.Background())
+			results <- struct {
+				changed int
+				err     error
+			}{changed: changed, err: err}
+		}(controller)
+	}
+	<-store.listed
+	<-store.listed
+	close(store.proceed)
+
+	first, second := <-results, <-results
+	require.NoError(t, first.err)
+	require.NoError(t, second.err)
+	require.Equal(t, 1, first.changed+second.changed)
+	store.mu.Lock()
+	require.Equal(t, task.StatusReady, store.value.Status)
+	require.Equal(t, int64(42), store.value.Version)
+	require.Equal(t, 1, store.transitionCall, "相同 status+version 只能有一个 Controller CAS 成功")
+	require.Equal(t, 1, store.outboxWrites)
+	store.mu.Unlock()
+}
+
+func TestSchedulingRecoveryTimeoutStaysBeyondLease(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, time.Minute, SchedulingRecoveryTimeout(10*time.Second))
+	require.Equal(t, time.Minute, SchedulingRecoveryTimeout(30*time.Second))
+	require.Equal(t, 90*time.Second, SchedulingRecoveryTimeout(45*time.Second))
+	require.Greater(t, SchedulingRecoveryTimeout(2*time.Minute), 2*time.Minute)
 }
 
 func schedulableCandidate() Candidate {

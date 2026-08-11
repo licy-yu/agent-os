@@ -117,11 +117,14 @@ type transitionKey struct {
 
 // taskTransitions 同时约束“从哪里到哪里”和“谁有权修改”。
 var taskTransitions = map[transitionKey]bool{
-	{ActorPlanner, StatusCreated, StatusPlanning}:        true,
-	{ActorPlanner, StatusPlanning, StatusBlocked}:        true,
-	{ActorPlanner, StatusPlanning, StatusReady}:          true,
-	{ActorController, StatusBlocked, StatusReady}:        true,
-	{ActorController, StatusRetryWait, StatusReady}:      true,
+	{ActorPlanner, StatusCreated, StatusPlanning}:   true,
+	{ActorPlanner, StatusPlanning, StatusBlocked}:   true,
+	{ActorPlanner, StatusPlanning, StatusReady}:     true,
+	{ActorController, StatusBlocked, StatusReady}:   true,
+	{ActorController, StatusRetryWait, StatusReady}: true,
+	// Scheduler 进程可能在 READY→SCHEDULING CAS 提交后被 SIGKILL。超过租约安全窗口后，
+	// Controller 有权把这个孤儿状态恢复为 READY；正常短窗口内仍只归 Scheduler 所有。
+	{ActorController, StatusScheduling, StatusReady}:     true,
 	{ActorScheduler, StatusReady, StatusScheduling}:      true,
 	{ActorScheduler, StatusScheduling, StatusAssigned}:   true,
 	{ActorScheduler, StatusScheduling, StatusReady}:      true,
