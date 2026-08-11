@@ -16,7 +16,10 @@ import (
 // ListReconcileTasks 只读取 Controller 有权处理的非终态任务。
 func (r *Repository) ListReconcileTasks(ctx context.Context, limit int) ([]*task.Task, error) {
 	rows, err := r.pool.Query(ctx, taskSelect+`
+		JOIN swarms run_scope ON run_scope.id=t.swarm_id
 		WHERE t.status IN ('CREATED','PLANNING','BLOCKED','RETRY_WAIT')
+		  AND run_scope.desired_state='RUNNING'
+		  AND run_scope.status IN ('PENDING','RUNNING')
 		ORDER BY t.updated_at,t.id
 		LIMIT $1`, limit)
 	if err != nil {
@@ -34,7 +37,9 @@ func (r *Repository) ListReconcileTasks(ctx context.Context, limit int) ([]*task
 	return items, rows.Err()
 }
 
-// DependenciesSatisfied 检查所有 HARD 依赖是否成功；SOFT 依赖不阻塞 READY。
+// DependenciesSatisfied 检查所有 required 依赖是否成功；SOFT 依赖不阻塞 READY。
+// DATA/APPROVAL/TEMPORAL 还会在后续专用 Controller 中检查 Artifact、Interaction 与时间条件，
+// 在专用条件满足前，其前置 Task 至少必须已经成功，不能被当作普通 SOFT 边跳过。
 func (r *Repository) DependenciesSatisfied(ctx context.Context, taskID uuid.UUID) (bool, error) {
 	var ready bool
 	err := r.pool.QueryRow(ctx, `
@@ -43,7 +48,8 @@ func (r *Repository) DependenciesSatisfied(ctx context.Context, taskID uuid.UUID
 			FROM task_dependencies d
 			JOIN tasks dependency ON dependency.id=d.depends_on_id
 			WHERE d.task_id=$1
-			  AND d.dependency_type='HARD'
+			  AND d.required=true
+			  AND d.dependency_type<>'SOFT'
 			  AND dependency.status <> 'SUCCEEDED'
 		)`, taskID).Scan(&ready)
 	if err != nil {
@@ -139,8 +145,10 @@ func (r *Repository) ListQueuedTasks(ctx context.Context, limit int) ([]orchestr
 		          JOIN tasks child ON child.id=d.task_id
 		         WHERE d.depends_on_id=t.id
 		           AND child.status NOT IN ('SUCCEEDED','FAILED','CANCELED','REJECTED')) AS blocked_children
-		FROM tasks t
+		FROM tasks t JOIN swarms run_scope ON run_scope.id=t.swarm_id
 		WHERE t.status='READY' AND t.available_at <= now()
+		  AND run_scope.desired_state='RUNNING'
+		  AND run_scope.status IN ('PENDING','RUNNING')
 		ORDER BY t.priority DESC,t.created_at
 		LIMIT $1`, limit)
 	if err != nil {

@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	stdErrors "errors"
 	"net/http"
 	"strconv"
 
@@ -16,7 +17,9 @@ import (
 	v1 "github.com/licy-yu/agent-os/api/controlplane/v1"
 	"github.com/licy-yu/agent-os/internal/conf"
 	consoleview "github.com/licy-yu/agent-os/internal/console"
+	"github.com/licy-yu/agent-os/internal/domain"
 	"github.com/licy-yu/agent-os/internal/observability"
+	"github.com/licy-yu/agent-os/internal/runcontrol"
 	"github.com/licy-yu/agent-os/internal/service"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -24,7 +27,8 @@ import (
 // NewHTTPServer 注册显式 REST 路由。
 // API 内部仍复用 protobuf 消息与 service 方法，因此它不是另一套业务实现。
 
-func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, consoleSvc *consoleview.Service,
+func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, runSvc *runcontrol.Service,
+	consoleSvc *consoleview.Service,
 	telemetry *observability.Telemetry, logger log.Logger,
 ) *khttp.Server {
 	middlewares := []middleware.Middleware{recovery.Recovery()}
@@ -103,6 +107,99 @@ func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, cons
 		return ctx.Returns(svc.GetTask(callCtx, &v1.GetTaskRequest{Id: ctx.Vars().Get("id")}))
 	}))
 
+	// V1.5 Run API 使用普通 JSON DTO。旧 /swarms API 继续可用，但所有新的暂停、恢复、
+	// Replan 和不可变 PlanVersion 能力都以 Run 为第一等对象。
+	route.POST("/runs", withOperation("/swarmos.run.v1.RunService/CreateRun", func(ctx khttp.Context, callCtx context.Context) error {
+		request := runcontrol.CreateRunRequest{}
+		if err := ctx.Bind(&request); err != nil {
+			return kratosErrors.BadRequest("INVALID_JSON", "请求体不是合法 Run JSON")
+		}
+		value, err := runSvc.Create(callCtx, request)
+		if err != nil {
+			return translateRunError(err)
+		}
+		return ctx.JSON(http.StatusCreated, value)
+	}))
+	route.GET("/runs", withOperation("/swarmos.run.v1.RunService/ListRuns", func(ctx khttp.Context, callCtx context.Context) error {
+		limit := 100
+		if raw := ctx.Query().Get("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil {
+				return kratosErrors.BadRequest("INVALID_LIMIT", "limit 必须是整数")
+			}
+			limit = parsed
+		}
+		items, err := runSvc.List(callCtx, limit)
+		if err != nil {
+			return translateRunError(err)
+		}
+		return ctx.JSON(http.StatusOK, map[string]any{"items": items})
+	}))
+	route.GET("/runs/{id}", withOperation("/swarmos.run.v1.RunService/GetRun", func(ctx khttp.Context, callCtx context.Context) error {
+		id, err := consoleID(ctx.Vars().Get("id"), "run.id")
+		if err != nil {
+			return err
+		}
+		value, err := runSvc.Get(callCtx, id)
+		if err != nil {
+			return translateRunError(err)
+		}
+		return ctx.JSON(http.StatusOK, value)
+	}))
+	route.GET("/runs/{id}/plans/{plan_id}", withOperation("/swarmos.run.v1.RunService/GetPlan", func(ctx khttp.Context, callCtx context.Context) error {
+		runID, err := consoleID(ctx.Vars().Get("id"), "run.id")
+		if err != nil {
+			return err
+		}
+		planID, err := consoleID(ctx.Vars().Get("plan_id"), "plan.id")
+		if err != nil {
+			return err
+		}
+		value, err := runSvc.GetPlan(callCtx, runID, planID)
+		if err != nil {
+			return translateRunError(err)
+		}
+		return ctx.JSON(http.StatusOK, value)
+	}))
+	registerRunAction := func(path, operation string,
+		action func(context.Context, uuid.UUID, string) (*runcontrol.RunView, error),
+	) {
+		route.POST(path, withOperation(operation, func(ctx khttp.Context, callCtx context.Context) error {
+			id, err := consoleID(ctx.Vars().Get("id"), "run.id")
+			if err != nil {
+				return err
+			}
+			request := struct {
+				Reason string `json:"reason"`
+			}{}
+			// 空请求体等价于空 reason，Pause/Resume/Cancel 仍会留下稳定的系统动作原因。
+			_ = ctx.Bind(&request)
+			value, err := action(callCtx, id, request.Reason)
+			if err != nil {
+				return translateRunError(err)
+			}
+			return ctx.JSON(http.StatusOK, value)
+		}))
+	}
+	registerRunAction("/runs/{id}:pause", "/swarmos.run.v1.RunService/PauseRun", runSvc.Pause)
+	registerRunAction("/runs/{id}:resume", "/swarmos.run.v1.RunService/ResumeRun", runSvc.Resume)
+	registerRunAction("/runs/{id}:cancel", "/swarmos.run.v1.RunService/CancelRun", runSvc.Cancel)
+	route.POST("/runs/{id}:replan", withOperation("/swarmos.run.v1.RunService/ReplanRun", func(ctx khttp.Context, callCtx context.Context) error {
+		id, err := consoleID(ctx.Vars().Get("id"), "run.id")
+		if err != nil {
+			return err
+		}
+		request := runcontrol.ReplanRequest{}
+		if err := ctx.Bind(&request); err != nil {
+			return kratosErrors.BadRequest("INVALID_JSON", "请求体不是合法 Replan JSON")
+		}
+		value, err := runSvc.Replan(callCtx, id, request)
+		if err != nil {
+			return translateRunError(err)
+		}
+		return ctx.JSON(http.StatusOK, value)
+	}))
+
 	// Console API 是只读的聚合视图，使用普通 JSON，避免把运维查询混入领域 Protobuf。
 	route.GET("/console/overview", withOperation("/swarmos.console.v1.Console/Overview", func(ctx khttp.Context, callCtx context.Context) error {
 		id, err := consoleID(ctx.Query().Get("swarm_id"), "swarm_id")
@@ -144,6 +241,21 @@ func NewHTTPServer(cfg conf.ServerConfig, svc *service.ControlPlaneService, cons
 		srv.HandlePrefix("/", newSPAHandler(cfg.WebDir))
 	}
 	return srv
+}
+
+func translateRunError(err error) error {
+	switch {
+	case stdErrors.Is(err, runcontrol.ErrInvalidRequest):
+		return kratosErrors.BadRequest("INVALID_RUN", err.Error())
+	case stdErrors.Is(err, runcontrol.ErrTemporalDisabled):
+		return kratosErrors.ServiceUnavailable("TEMPORAL_DISABLED", err.Error())
+	case stdErrors.Is(err, domain.ErrNotFound):
+		return kratosErrors.NotFound("NOT_FOUND", err.Error())
+	case stdErrors.Is(err, domain.ErrConflict), stdErrors.Is(err, domain.ErrInvalidTransition):
+		return kratosErrors.Conflict("RUN_CONFLICT", err.Error())
+	default:
+		return kratosErrors.InternalServer("INTERNAL_ERROR", "Run 控制面内部错误")
+	}
 }
 
 // observedHandler 同时接收 Kratos HTTP Context 与中间件产生的调用 Context：前者负责绑定和

@@ -19,6 +19,7 @@ import (
 	"github.com/licy-yu/agent-os/internal/infrastructure/redislease"
 	"github.com/licy-yu/agent-os/internal/observability"
 	"github.com/licy-yu/agent-os/internal/orchestrator"
+	"github.com/licy-yu/agent-os/internal/runcontrol"
 	"github.com/licy-yu/agent-os/internal/server"
 	"github.com/licy-yu/agent-os/internal/service"
 )
@@ -78,8 +79,9 @@ func main() {
 	defer func() { _ = eventBus.Close() }()
 
 	svc := service.NewControlPlaneService(repository, repository, repository, repository)
+	runSvc := runcontrol.NewService(repository, false)
 	consoleSvc := consoleview.NewService(repository)
-	httpServer := server.NewHTTPServer(cfg.Server, svc, consoleSvc, telemetry, logger)
+	httpServer := server.NewHTTPServer(cfg.Server, svc, runSvc, consoleSvc, telemetry, logger)
 	grpcServer := server.NewGRPCServer(cfg.Server, svc, telemetry, logger)
 	taskController := orchestrator.NewTaskController(repository, logger)
 	agentController := orchestrator.NewAgentController(repository)
