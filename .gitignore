@@ -25,6 +25,7 @@ web/dist/
 /node_modules/
 
 # 临时文件和运行数据
+/.cache/
 /tmp/
 /data/
 *.log
