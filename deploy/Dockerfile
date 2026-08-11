@@ -7,9 +7,11 @@ RUN apk add --no-cache ca-certificates \
     && adduser -S -D -H -u 10001 -G swarmos swarmos
 
 WORKDIR /app
-COPY --chown=swarmos:swarmos bin/control-plane /app/bin/control-plane
-COPY --chown=swarmos:swarmos bin/worker /app/bin/worker
-COPY --chown=swarmos:swarmos bin/workflow-worker /app/bin/workflow-worker
+# `--chmod` 让镜像构建不依赖发布机/压缩包是否保留 Unix executable bit。
+# 这对从 Windows 交叉编译并打包到 Linux VM 的发布链尤其重要。
+COPY --chown=swarmos:swarmos --chmod=0555 bin/control-plane /app/bin/control-plane
+COPY --chown=swarmos:swarmos --chmod=0555 bin/worker /app/bin/worker
+COPY --chown=swarmos:swarmos --chmod=0555 bin/workflow-worker /app/bin/workflow-worker
 COPY --chown=swarmos:swarmos configs/config.yaml /app/configs/config.yaml
 COPY --chown=swarmos:swarmos web/dist /app/web/dist
 
