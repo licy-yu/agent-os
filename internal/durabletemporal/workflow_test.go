@@ -41,17 +41,33 @@ func TestSwarmRunWorkflowSignalPauseResumeAndCancel(t *testing.T) {
 	require.Equal(t, int64(3), final.SignalSequence)
 }
 
-func TestSwarmRunWorkflowReplanIsMonotonic(t *testing.T) {
+func TestSwarmRunWorkflowReplanIgnoresDuplicateAndStaleVersions(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()
 	env.RegisterWorkflow(SwarmRunWorkflow)
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(SignalRunCommand, RunCommand{Action: "REPLAN", PlanVersion: 4})
-		env.SignalWorkflow(SignalRunCommand, RunCommand{Action: "REPLAN", PlanVersion: 2})
+		env.SignalWorkflow(SignalRunCommand, RunCommand{Action: "REPLAN", PlanVersion: 4, Reason: "新计划"})
+		env.SignalWorkflow(SignalRunCommand, RunCommand{Action: "REPLAN", PlanVersion: 4, Reason: "重复投递"})
+		env.SignalWorkflow(SignalRunCommand, RunCommand{Action: "REPLAN", PlanVersion: 2, Reason: "陈旧投递"})
 		env.SignalWorkflow(SignalRunCommand, RunCommand{Action: "CANCEL"})
 	}, time.Second)
 	env.ExecuteWorkflow(SwarmRunWorkflow, WorkflowInput{RunID: "run", TenantID: "tenant", PlanVersion: 1})
 	var final RuntimeState
 	require.NoError(t, env.GetWorkflowResult(&final))
-	require.Equal(t, int32(5), final.PlanVersion)
+	require.Equal(t, int32(4), final.PlanVersion)
+	require.Equal(t, int64(4), final.SignalSequence)
+}
+
+func TestApplyProjectionCorrectsPlanVersionToDatabaseTruth(t *testing.T) {
+	now := time.Date(2026, time.August, 11, 10, 30, 0, 0, time.UTC)
+	state := RuntimeState{
+		PlanVersion: 8,
+		LastError:   "上一轮投影失败",
+	}
+
+	applyProjection(&state, Projection{PlanVersion: 3}, now)
+
+	require.Equal(t, int32(3), state.PlanVersion)
+	require.Empty(t, state.LastError)
+	require.Equal(t, now, state.UpdatedAt)
 }

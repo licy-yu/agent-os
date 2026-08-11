@@ -49,6 +49,9 @@ type Runtime struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	done   chan struct{}
+	// activeTasks 是进程内 Task singleflight。workerID 按进程唯一，但一个进程有多个
+	// 并发槽；若同一 task.assigned 被重复投递，不能让两个槽共享同一 fence 执行。
+	activeTasks map[uuid.UUID]chan struct{}
 }
 
 func NewRuntime(workerID string, source assignment.Source, store execution.Store, toolStore toolgateway.Store,
@@ -63,6 +66,7 @@ func NewRuntime(workerID string, source assignment.Source, store execution.Store
 		router: router, adapters: adapters, concurrency: concurrency,
 		heartbeatInterval: heartbeatInterval,
 		logger:            log.NewHelper(log.With(logger, "component", "worker-runtime", "worker_id", workerID)),
+		activeTasks:       make(map[uuid.UUID]chan struct{}),
 	}
 }
 
@@ -131,15 +135,20 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 	if err := json.Unmarshal(message.Data(), &event); err != nil || event.TaskID == uuid.Nil || event.AgentID == uuid.Nil {
 		// 永久格式错误不应无限重投；确认后依靠日志和 JetStream 原始消息审计。
 		r.logger.Errorf("丢弃非法 task.assigned 消息: %v", err)
-		return message.Ack(parent)
+		return ackMessage(parent, message)
 	}
+	releaseTask, err := r.acquireTask(parent, event.TaskID, message)
+	if err != nil {
+		return err
+	}
+	defer releaseTask()
 	work, err := r.store.ClaimWork(parent, event.TaskID, event.AgentID, r.workerID)
 	if err != nil {
 		return fmt.Errorf("领取 task %s: %w", event.TaskID, err)
 	}
 	if work == nil {
 		// 已处理或已重新绑定的陈旧消息可以安全 ACK。
-		return message.Ack(parent)
+		return ackMessage(parent, message)
 	}
 	parent, span := otel.Tracer("swarmos/worker").Start(parent, "worker.execute",
 		trace.WithSpanKind(trace.SpanKindConsumer),
@@ -172,9 +181,22 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 	cancel()
 	<-heartbeatDone
 	if keepAttemptOpen(executeErr) {
-		// 审批等待与 UNKNOWN 对账都不是普通执行失败。保持 RUNNING Attempt 后 NAK，
-		// 下一次投递会由 ClaimWork 装载 LatestCheckpoint；AUTHORIZED 后才继续外部调用。
-		return executeErr
+		// 审批窗口可能长达 24 小时，UNKNOWN 对账也没有固定完成时间。这里把执行权
+		// 持久化为 WAITING 并 ACK 当前消息；审批/对账完成事务会重新发布 task.assigned。
+		// 这样既不会耗尽 JetStream MaxDeliver，也不会被心跳恢复器误判成 Worker 崩溃。
+		reason := execution.WaitForApproval
+		if errors.Is(executeErr, toolgateway.ErrEffectReconcileRequired) {
+			reason = execution.WaitForExternal
+		}
+		wait := execution.AttemptWait{Reason: reason, EffectID: toolgateway.WaitingEffectID(executeErr)}
+		if err := r.store.SuspendAttempt(parent, owner, wait); err != nil {
+			return fmt.Errorf("挂起 attempt %s: %w", work.Attempt.ID, err)
+		}
+		if err := ackMessage(parent, message); err != nil {
+			return fmt.Errorf("确认已挂起 task %s 的消息: %w", event.TaskID, err)
+		}
+		span.SetStatus(codes.Ok, "execution suspended at durable wait boundary")
+		return nil
 	}
 	if executeErr != nil {
 		span.RecordError(executeErr)
@@ -201,13 +223,64 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("提交 attempt %s 结果: %w", work.Attempt.ID, err)
 	}
-	if err := message.Ack(parent); err != nil {
+	if err := ackMessage(parent, message); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("确认 task %s 消息: %w", event.TaskID, err)
 	}
 	span.SetStatus(codes.Ok, "execution submitted for review")
 	return nil
+}
+
+// acquireTask 串行化同一进程内相同 Task 的重复投递。等待中的副本定期 InProgress，
+// 因此不会消耗 MaxDeliver；前一个执行流离开后，副本再从数据库重新判定是否需要工作。
+func (r *Runtime) acquireTask(ctx context.Context, taskID uuid.UUID,
+	message assignment.Message,
+) (func(), error) {
+	for {
+		r.mu.Lock()
+		active, exists := r.activeTasks[taskID]
+		if !exists {
+			active = make(chan struct{})
+			r.activeTasks[taskID] = active
+			r.mu.Unlock()
+			return func() {
+				r.mu.Lock()
+				if current, ok := r.activeTasks[taskID]; ok && current == active {
+					delete(r.activeTasks, taskID)
+					close(active)
+				}
+				r.mu.Unlock()
+			}, nil
+		}
+		r.mu.Unlock()
+
+		interval := r.heartbeatInterval
+		if interval <= 0 {
+			interval = 10 * time.Second
+		}
+		ticker := time.NewTicker(interval)
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return nil, ctx.Err()
+		case <-active:
+			ticker.Stop()
+			// 前一个执行流已提交状态；重新竞争 singleflight 后再读数据库。
+			continue
+		case <-ticker.C:
+			ticker.Stop()
+			if err := message.InProgress(); err != nil {
+				return nil, fmt.Errorf("续期重复 task %s 消息: %w", taskID, err)
+			}
+		}
+	}
+}
+
+func ackMessage(parent context.Context, message assignment.Message) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	return message.Ack(ctx)
 }
 
 func keepAttemptOpen(err error) bool {

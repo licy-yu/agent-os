@@ -28,6 +28,9 @@ type toolEffectRow struct {
 	RequestHash           string
 	Risk                  effect.RiskLevel
 	Result                map[string]any
+	ExternalRef           string
+	ErrorCode             string
+	ErrorMessage          string
 	ApprovalInteractionID *uuid.UUID
 	AuthorizationBlocked  bool
 	BlockReason           string
@@ -40,6 +43,17 @@ type gatewayEffectPolicy struct {
 	AllowedEffects  []string `json:"allowed_effects"`
 	RequireApproval bool     `json:"require_approval"`
 }
+
+// finishToolEffectUpdateSQL 使用 jsonb 顶层合并，而不是整列替换 sanitized_result。
+// Adapter 只能写入 result 键；审批流程已经写入的 _authorization 审计证据因此会保留。
+const finishToolEffectUpdateSQL = `
+	UPDATE effects SET status=$5,
+		sanitized_result=COALESCE(sanitized_result,'{}'::jsonb) || $6::jsonb,
+		external_ref=NULLIF($7,''),
+		error_code=NULLIF($8,''),error_message=NULLIF($9,''),reconcile_after=$10,
+		finished_at=$11,version=version+1,updated_at=$11
+	WHERE id=$1 AND tenant_id=$2 AND attempt_id=$3 AND fencing_token=$4 AND status='EXECUTING'
+	RETURNING version`
 
 // PrepareToolEffect 是 R2/R3 的唯一准备入口。它在 Attempt 行锁和 tenant+idempotency_key
 // advisory lock 下完成同键异参判定；R3 的 Effect 与 WAITING Interaction 也在本事务原子创建。
@@ -344,12 +358,7 @@ func (r *Repository) FinishToolEffect(ctx context.Context, owner execution.Attem
 			errorCode = "EXTERNAL_RESULT_UNKNOWN"
 		}
 		var nextVersion int64
-		err = tx.QueryRow(ctx, `
-			UPDATE effects SET status=$5,sanitized_result=$6,external_ref=NULLIF($7,''),
-				error_code=NULLIF($8,''),error_message=NULLIF($9,''),reconcile_after=$10,
-				finished_at=$11,version=version+1,updated_at=$11
-			WHERE id=$1 AND tenant_id=$2 AND attempt_id=$3 AND fencing_token=$4 AND status='EXECUTING'
-			RETURNING version`,
+		err = tx.QueryRow(ctx, finishToolEffectUpdateSQL,
 			effectID, tenantID, owner.AttemptID, owner.FencingToken, completion.Status,
 			sanitized, completion.ExternalRef, errorCode, completion.ErrorMessage, reconcileAfter,
 			completion.FinishedAt).Scan(&nextVersion)
@@ -358,8 +367,7 @@ func (r *Repository) FinishToolEffect(ctx context.Context, owner execution.Attem
 				return mapWriteError("完成 Tool Effect", err)
 			}
 			current, readErr := loadToolEffectByID(ctx, tx, tenantID, effectID)
-			if readErr == nil && current.Status == completion.Status && reflect.DeepEqual(
-				current.Result["result"], sanitizeEffectValue(completion.Result)) {
+			if readErr == nil && sameToolEffectCompletion(current, completion, errorCode, sanitized) {
 				return nil
 			}
 			return fmt.Errorf("%w: Effect 已由其它结果结束或 fence 失效", domain.ErrConflict)
@@ -370,6 +378,21 @@ func (r *Repository) FinishToolEffect(ctx context.Context, owner execution.Attem
 			"external_ref": completion.ExternalRef,
 		})
 	})
+}
+
+// sameToolEffectCompletion 只比较本次完成命令拥有的字段。sanitized_result 中的
+// _authorization 属于审批流程，既不能被 Adapter 覆盖，也不应导致同结果重放失配。
+func sameToolEffectCompletion(current *toolEffectRow, completion toolgateway.EffectCompletion,
+	errorCode string, normalizedResult []byte,
+) bool {
+	var expected map[string]any
+	if err := json.Unmarshal(normalizedResult, &expected); err != nil {
+		return false
+	}
+	return current != nil && current.Status == completion.Status &&
+		current.ExternalRef == completion.ExternalRef && current.ErrorCode == errorCode &&
+		current.ErrorMessage == completion.ErrorMessage &&
+		reflect.DeepEqual(current.Result["result"], expected["result"])
 }
 
 func loadToolEffectByKey(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, key string) (*toolEffectRow, error) {
@@ -384,6 +407,7 @@ func loadToolEffectByID(ctx context.Context, tx pgx.Tx, tenantID, id uuid.UUID) 
 
 const toolEffectSelect = `
 	SELECT id,attempt_id,tool_call_id,status,request_hash,risk_level,sanitized_result,
+	       COALESCE(external_ref,''),COALESCE(error_code,''),COALESCE(error_message,''),
 	       approval_interaction_id,
 	       (COALESCE(sanitized_result #>> '{_authorization,blocked}','false')='true'),
 	       COALESCE(sanitized_result #>> '{_authorization,reason}',''),version,updated_at
@@ -393,7 +417,8 @@ func scanToolEffect(row rowScanner) (*toolEffectRow, error) {
 	value := new(toolEffectRow)
 	var raw []byte
 	if err := row.Scan(&value.ID, &value.AttemptID, &value.ToolCallID, &value.Status,
-		&value.RequestHash, &value.Risk, &raw, &value.ApprovalInteractionID,
+		&value.RequestHash, &value.Risk, &raw, &value.ExternalRef, &value.ErrorCode,
+		&value.ErrorMessage, &value.ApprovalInteractionID,
 		&value.AuthorizationBlocked, &value.BlockReason, &value.Version, &value.UpdatedAt); err != nil {
 		return nil, err
 	}

@@ -63,4 +63,16 @@ return 0`
 
 func (m *Manager) Close() error { return m.client.Close() }
 
+// Ping 供控制面 readiness 探针验证 Scheduler 的 Lease 依赖。它不创建任何业务 Key，
+// 因此探针不会污染 Redis，也不会与真实 Reserve 竞争。
+func (m *Manager) Ping(ctx context.Context) error {
+	if m == nil || m.client == nil {
+		return fmt.Errorf("Redis Lease Manager 未初始化")
+	}
+	if err := m.client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("Redis Ping: %w", err)
+	}
+	return nil
+}
+
 func key(agentID uuid.UUID) string { return keyPrefix + agentID.String() }

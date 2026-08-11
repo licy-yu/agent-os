@@ -429,18 +429,45 @@ func (r *Repository) loadDependencies(ctx context.Context, tasks []*task.Task) e
 }
 
 func (r *Repository) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("开始数据库事务: %w", err)
+	const maximumAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maximumAttempts; attempt++ {
+		tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+		if err != nil {
+			return fmt.Errorf("开始数据库事务: %w", err)
+		}
+		err = fn(tx)
+		if err == nil {
+			err = tx.Commit(ctx)
+		} else {
+			_ = tx.Rollback(context.Background())
+		}
+		if err == nil {
+			return nil
+		}
+		// Commit 失败时事务也可能已被 PostgreSQL 中止；Rollback 是幂等清理，
+		// 不根据它的返回值覆盖真正的领域/SQL 错误。
+		_ = tx.Rollback(context.Background())
+		lastErr = err
+		if !retryableTransactionError(err) || attempt == maximumAttempts {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt*10) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("提交数据库事务: %w", err)
-	}
-	return nil
+	return lastErr
+}
+
+// retryableTransactionError 只重放 PostgreSQL 明确定义的并发瞬态：死锁与可序列化失败。
+// 唯一键、外键、CHECK 或业务 CAS 都是确定性错误，绝不能靠重试掩盖。
+func retryableTransactionError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40P01" || pgErr.Code == "40001")
 }
 
 func insertOutbox(ctx context.Context, tx pgx.Tx, aggregateType string, aggregateID uuid.UUID, eventType string, version int64, payload any) error {

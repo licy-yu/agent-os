@@ -18,13 +18,39 @@ import (
 type AttemptStatus string
 
 const (
-	AttemptCreated   AttemptStatus = "CREATED"
-	AttemptRunning   AttemptStatus = "RUNNING"
+	AttemptCreated AttemptStatus = "CREATED"
+	AttemptRunning AttemptStatus = "RUNNING"
+	// AttemptWaiting 表示执行权已经主动归还，等待审批或外部对账。
+	// 它不是失败，也不应被心跳超时回收；恢复时沿用同一 Attempt，并签发新的 fencing token。
+	AttemptWaiting   AttemptStatus = "WAITING"
 	AttemptReview    AttemptStatus = "REVIEW"
 	AttemptSucceeded AttemptStatus = "SUCCEEDED"
 	AttemptFailed    AttemptStatus = "FAILED"
 	AttemptAborted   AttemptStatus = "ABORTED"
 )
+
+// AttemptWaitReason 区分“等人批准”和“等外部系统确认”。持久化层据此选择
+// Task 的 WAITING_APPROVAL/WAITING_EXTERNAL 状态，避免用一条模糊的 RUNNING
+// 记录长时间占住 Worker 与 JetStream 投递次数。
+type AttemptWaitReason string
+
+const (
+	WaitForApproval AttemptWaitReason = "APPROVAL"
+	WaitForExternal AttemptWaitReason = "EXTERNAL"
+)
+
+func (r AttemptWaitReason) Valid() bool {
+	return r == WaitForApproval || r == WaitForExternal
+}
+
+// AttemptWait 精确指向触发等待的 Effect。禁止按“最新 Effect”猜测，因为同一 Attempt
+// 可能已产生多条副作用；猜错会把一条审批结论应用到另一条外部操作。
+type AttemptWait struct {
+	Reason   AttemptWaitReason
+	EffectID uuid.UUID
+}
+
+func (w AttemptWait) Valid() bool { return w.Reason.Valid() && w.EffectID != uuid.Nil }
 
 // Attempt 保存一次执行所需的最小审计信息。Input/Output 是执行当时的不可变快照。
 type Attempt struct {
@@ -206,11 +232,15 @@ type Evaluation struct {
 // ClaimWork 和 ApplyReview 是状态机边界，必须在单个数据库事务内同时写入 Outbox。
 type Store interface {
 	ClaimWork(context.Context, uuid.UUID, uuid.UUID, string) (*Work, error)
+	SuspendAttempt(context.Context, AttemptOwner, AttemptWait) error
 	SaveCheckpoint(context.Context, AttemptOwner, Checkpoint) error
 	HeartbeatAttempt(context.Context, AttemptOwner) error
 	CompleteAttempt(context.Context, AttemptOwner, ExecutionResult) error
 	ListReviewWork(context.Context, int) ([]*Work, error)
 	ApplyReview(context.Context, *Work, Evaluation, time.Time) error
+	// ExpireWaitingInteractions 收敛已超过 expires_at 的持久化人工等待。实现必须使用
+	// 数据库行锁与 CAS，让自动过期和并发人工审批至多只有一方成功。
+	ExpireWaitingInteractions(context.Context, time.Time, int) (int, error)
 	RecoverTimedOut(context.Context, time.Time, int) (int, error)
 }
 

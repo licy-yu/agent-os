@@ -304,8 +304,31 @@ func (r *Repository) cancelRunWork(ctx context.Context, tx pgx.Tx, tenantID, run
 		UPDATE task_attempts a SET status='ABORTED',finished_at=now(),
 			error_code='RUN_CANCELED',error_message='Run 被用户取消',updated_at=now()
 		FROM tasks t WHERE a.task_id=t.id AND t.tenant_id=$1 AND t.swarm_id=$2
-		  AND a.status IN ('CREATED','RUNNING','REVIEW')`, tenantID, runID); err != nil {
+		  AND a.status IN ('CREATED','RUNNING','WAITING','REVIEW')`, tenantID, runID); err != nil {
 		return fmt.Errorf("中止 Run Attempts: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE interactions SET status='CANCELED',resolved_by='run-cancel',resolved_at=now(),
+		       version=version+1,updated_at=now()
+		WHERE tenant_id=$1 AND run_id=$2 AND status='WAITING'`, tenantID, runID); err != nil {
+		return fmt.Errorf("取消 Run Interactions: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE effects
+		SET sanitized_result=jsonb_set(
+				COALESCE(sanitized_result,'{}'::jsonb),'{_authorization}',
+				COALESCE(sanitized_result->'_authorization','{}'::jsonb) ||
+				jsonb_build_object('blocked',true,'reason','Run 被用户取消'),true),
+			error_code='RUN_CANCELED',error_message='Run 被用户取消',
+			version=version+1,updated_at=now()
+		WHERE tenant_id=$1 AND run_id=$2 AND status IN ('PREPARED','AUTHORIZED')`, tenantID, runID); err != nil {
+		return fmt.Errorf("封存 Run 未执行 Effects: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tool_calls tc SET status='FAILED',error_message='Run 被用户取消',finished_at=now()
+		FROM tasks t WHERE tc.task_id=t.id AND t.tenant_id=$1 AND t.swarm_id=$2
+		  AND tc.status='STARTED'`, tenantID, runID); err != nil {
+		return fmt.Errorf("结束 Run ToolCalls: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE agent_instances ai SET status='IDLE',current_task_id=NULL,load=0,
@@ -347,7 +370,7 @@ func (r *Repository) ActivateReplan(ctx context.Context, tenantID, runID uuid.UU
 			SELECT EXISTS(
 				SELECT 1 FROM effects
 				WHERE tenant_id=$1 AND run_id=$2
-				  AND status IN ('EXECUTING','UNKNOWN','RECONCILING','COMPENSATING')
+				  AND status IN ('PREPARED','AUTHORIZED','EXECUTING','UNKNOWN','RECONCILING','COMPENSATING')
 			)`, tenantID, runID).Scan(&activeEffects); err != nil {
 			return fmt.Errorf("检查 Replan Effect 安全点: %w", err)
 		}
@@ -358,7 +381,7 @@ func (r *Repository) ActivateReplan(ctx context.Context, tenantID, runID uuid.UU
 			UPDATE task_attempts a SET status='ABORTED',finished_at=now(),
 				error_code='PLAN_SUPERSEDED',error_message='Replan 已激活新计划',updated_at=now()
 			FROM tasks t WHERE a.task_id=t.id AND t.tenant_id=$1 AND t.swarm_id=$2
-			  AND a.status IN ('CREATED','RUNNING')`, tenantID, runID); err != nil {
+			  AND a.status IN ('CREATED','RUNNING','WAITING')`, tenantID, runID); err != nil {
 			return fmt.Errorf("隔离旧 Plan Attempts: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -367,6 +390,12 @@ func (r *Repository) ActivateReplan(ctx context.Context, tenantID, runID uuid.UU
 			FROM tasks t WHERE ai.current_task_id=t.id AND t.tenant_id=$1 AND t.swarm_id=$2`,
 			tenantID, runID); err != nil {
 			return fmt.Errorf("释放旧 Plan Agents: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE interactions SET status='CANCELED',resolved_by='replan',resolved_at=now(),
+			       version=version+1,updated_at=now()
+			WHERE tenant_id=$1 AND run_id=$2 AND status='WAITING'`, tenantID, runID); err != nil {
+			return fmt.Errorf("取消被替代 Plan Interactions: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE tasks SET status='CANCELED',assigned_agent_id=NULL,version=version+1,updated_at=now()

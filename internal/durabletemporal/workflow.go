@@ -140,12 +140,12 @@ func applyCommand(state *RuntimeState, command RunCommand, now time.Time) {
 		state.Status, state.DesiredState = "CANCELED", "CANCELED"
 		state.WaitingReason = command.Reason
 	case "REPLAN":
+		// PlanVersion 以 PostgreSQL 已提交的 PlanVersion 为准。重复或陈旧 Signal
+		// 只代表同一事实的再次投递，不能在 Workflow 内凭空生成新版本。
 		if command.PlanVersion > state.PlanVersion {
 			state.PlanVersion = command.PlanVersion
-		} else {
-			state.PlanVersion++
+			state.WaitingReason = command.Reason
 		}
-		state.WaitingReason = command.Reason
 	case "WAIT_INPUT", "WAIT_APPROVAL":
 		state.Status, state.DesiredState = "WAITING_USER", "WAITING_USER"
 		state.WaitingReason = command.Reason
@@ -171,9 +171,9 @@ func applyProjection(state *RuntimeState, projection Projection, now time.Time) 
 	if projection.DesiredState != "" {
 		state.DesiredState = projection.DesiredState
 	}
-	if projection.PlanVersion > state.PlanVersion {
-		state.PlanVersion = projection.PlanVersion
-	}
+	// Projection 是 PostgreSQL 真值快照，必须精确覆盖本地值；这也能向下纠正
+	// 历史重复 Signal 曾造成的 PlanVersion 漂移。
+	state.PlanVersion = projection.PlanVersion
 	state.CurrentTaskID = projection.CurrentTaskID
 	state.CurrentStep = projection.CurrentStep
 	state.LastError = ""

@@ -44,5 +44,6 @@ func TestDeterministicExecutorProducesReviewEvidence(t *testing.T) {
 	require.True(t, result.Checks["build"])
 	require.True(t, result.Checks["unit_test"])
 	require.True(t, result.Checks["contract"])
+	require.Equal(t, "确定性执行器已完成任务", result.Output["output"])
 	require.Equal(t, int64(192), result.CostMicros)
 }

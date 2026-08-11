@@ -287,6 +287,15 @@ func (r *Repository) ResolveInteraction(ctx context.Context, record safetycontro
 	if record.Authorization != nil && record.Rejection != nil {
 		return nil, fmt.Errorf("%w: 同一次审批不能同时批准和拒绝", safetycontrol.ErrInvalidStoreResult)
 	}
+	if record.ResumeWaitingAttempt && record.FailWaitingAttempt {
+		return nil, fmt.Errorf("%w: 同一审批不能同时恢复和终止 Attempt", safetycontrol.ErrInvalidStoreResult)
+	}
+	if record.ResumeWaitingAttempt && record.Authorization == nil {
+		return nil, fmt.Errorf("%w: 恢复 Attempt 必须携带 Effect 授权", safetycontrol.ErrInvalidStoreResult)
+	}
+	if record.FailWaitingAttempt && record.Rejection == nil {
+		return nil, fmt.Errorf("%w: 终止 Attempt 必须携带 Effect 拒绝事实", safetycontrol.ErrInvalidStoreResult)
+	}
 	var result *safetycontrol.InteractionView
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
 		replay, err := beginSafetyMutation(ctx, tx, record.Mutation)
@@ -352,6 +361,12 @@ func (r *Repository) ResolveInteraction(ctx context.Context, record safetycontro
 				}); err != nil {
 				return err
 			}
+			if record.ResumeWaitingAttempt {
+				if err := resumeWaitingAttemptAfterApproval(ctx, tx, record.Mutation.TenantID,
+					record.Authorization.EffectID, record.Mutation.OccurredAt); err != nil {
+					return err
+				}
+			}
 		}
 
 		if record.Rejection != nil {
@@ -380,6 +395,16 @@ func (r *Repository) ResolveInteraction(ctx context.Context, record safetycontro
 			if command.RowsAffected() != 1 {
 				return fmt.Errorf("%w: Effect 已变化或审批证据不匹配", safetycontrol.ErrVersionConflict)
 			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE tool_calls tc
+				SET status='DENIED',error_message=$3,finished_at=$4
+				FROM effects e
+				WHERE e.tenant_id=$1 AND e.id=$2 AND tc.id=e.tool_call_id
+				  AND tc.attempt_id=e.attempt_id AND tc.status='STARTED'`,
+				record.Mutation.TenantID, record.Rejection.EffectID,
+				record.Rejection.Reason, record.Rejection.RejectedAt); err != nil {
+				return mapWriteError("结束审批拒绝 ToolCall", err)
+			}
 			if err := insertTenantOutbox(ctx, tx, record.Mutation.TenantID, "effect",
 				record.Rejection.EffectID, "effect.authorization_rejected",
 				record.Rejection.ExpectedEffectVersion+1, map[string]any{
@@ -387,6 +412,13 @@ func (r *Repository) ResolveInteraction(ctx context.Context, record safetycontro
 					"reason": record.Rejection.Reason, "authorization_blocked": true,
 				}); err != nil {
 				return err
+			}
+			if record.FailWaitingAttempt {
+				if err := failWaitingAttemptAfterRejection(ctx, tx, record.Mutation.TenantID,
+					record.Rejection.EffectID, record.Rejection.Reason,
+					record.Mutation.OccurredAt); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -407,6 +439,179 @@ func (r *Repository) ResolveInteraction(ctx context.Context, record safetycontro
 		})
 	})
 	return result, err
+}
+
+// resumeWaitingAttemptAfterApproval 把 Effect 授权和原 Task 的重新投递放在同一事务。
+// 若数据来自升级前版本、Attempt 仍为 RUNNING，则保持兼容并不重复投递；新路径只接管
+// 明确处于 WAITING 的 Attempt。
+func resumeWaitingAttemptAfterApproval(ctx context.Context, tx pgx.Tx, tenantID, effectID uuid.UUID,
+	now time.Time,
+) error {
+	return resumeWaitingAttempt(ctx, tx, tenantID, effectID, "WAITING_APPROVAL", now)
+}
+
+func resumeWaitingAttemptAfterReconcile(ctx context.Context, tx pgx.Tx, tenantID, effectID uuid.UUID,
+	now time.Time,
+) error {
+	return resumeWaitingAttempt(ctx, tx, tenantID, effectID, "WAITING_EXTERNAL", now)
+}
+
+func resumeWaitingAttempt(ctx context.Context, tx pgx.Tx, tenantID, effectID uuid.UUID,
+	waitingTaskStatus string, now time.Time,
+) error {
+	var attemptID, taskID, runID, agentID uuid.UUID
+	var attemptStatus string
+	err := tx.QueryRow(ctx, `
+		SELECT e.attempt_id,e.task_id,e.run_id,a.agent_id,a.status
+		FROM effects e JOIN task_attempts a ON a.id=e.attempt_id
+		WHERE e.tenant_id=$1 AND e.id=$2 FOR UPDATE OF a`, tenantID, effectID).
+		Scan(&attemptID, &taskID, &runID, &agentID, &attemptStatus)
+	if err != nil {
+		return mapReadError("读取审批关联 Attempt", err)
+	}
+	if attemptStatus != "WAITING" {
+		return nil
+	}
+
+	var taskVersion int64
+	err = tx.QueryRow(ctx, `
+		UPDATE tasks
+		SET status='ASSIGNED',version=version+1,updated_at=$5
+		WHERE tenant_id=$1 AND id=$2 AND status=$6
+		  AND assigned_agent_id=$3 AND swarm_id=$4
+		RETURNING version`, tenantID, taskID, agentID, runID, now, waitingTaskStatus).Scan(&taskVersion)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: 待审批 Task 状态或 Agent 绑定已变化", safetycontrol.ErrVersionConflict)
+		}
+		return mapWriteError("重新分配审批 Task", err)
+	}
+	var agentVersion int64
+	err = tx.QueryRow(ctx, `
+		UPDATE agent_instances
+		SET status='RESERVED',version=version+1,updated_at=$4
+		WHERE tenant_id=$1 AND id=$2 AND status='WAITING_TOOL' AND current_task_id=$3
+		RETURNING version`, tenantID, agentID, taskID, now).Scan(&agentVersion)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: 待审批 Agent 状态或 Task 绑定已变化", safetycontrol.ErrVersionConflict)
+		}
+		return mapWriteError("重新预留审批 Agent", err)
+	}
+	if err := insertTenantOutbox(ctx, tx, tenantID, "task", taskID, "task.assigned",
+		taskVersion, map[string]any{
+			"id": taskID, "run_id": runID, "agent_id": agentID,
+			"attempt_id": attemptID, "resumed": true, "version": taskVersion,
+		}); err != nil {
+		return err
+	}
+	return insertTenantOutbox(ctx, tx, tenantID, "agent_instance", agentID,
+		"agent.reserved", agentVersion, map[string]any{
+			"id": agentID, "run_id": runID, "task_id": taskID,
+			"resumed": true, "version": agentVersion,
+		})
+}
+
+// failWaitingAttemptAfterRejection 让“拒绝”成为完整终态，而不是留下永远无法恢复的
+// PREPARED Effect 与 WAITING Task。Effect 自身仍按安全合同保留 PREPARED+blocked 事实；
+// Attempt、Task 和 Run 则以明确的审批拒绝原因失败，便于审计和告警。
+func failWaitingAttemptAfterRejection(ctx context.Context, tx pgx.Tx, tenantID, effectID uuid.UUID,
+	reason string, now time.Time,
+) error {
+	if strings.TrimSpace(reason) == "" {
+		reason = "人工审批已拒绝"
+	}
+	return failWaitingAttempt(ctx, tx, tenantID, effectID, "WAITING_APPROVAL",
+		"APPROVAL_REJECTED", "approval_rejected", reason, now)
+}
+
+func failWaitingAttemptAfterReconcile(ctx context.Context, tx pgx.Tx, tenantID, effectID uuid.UUID,
+	reason string, now time.Time,
+) error {
+	if strings.TrimSpace(reason) == "" {
+		reason = "外部对账确认 Effect 失败"
+	}
+	return failWaitingAttempt(ctx, tx, tenantID, effectID, "WAITING_EXTERNAL",
+		"EFFECT_RECONCILED_FAILED", "effect_reconciled_failed", reason, now)
+}
+
+func failWaitingAttempt(ctx context.Context, tx pgx.Tx, tenantID, effectID uuid.UUID,
+	waitingTaskStatus, failureCode, reasonCode, reason string, now time.Time,
+) error {
+	var attemptID, taskID, runID, agentID uuid.UUID
+	var attemptStatus string
+	err := tx.QueryRow(ctx, `
+		SELECT e.attempt_id,e.task_id,e.run_id,a.agent_id,a.status
+		FROM effects e JOIN task_attempts a ON a.id=e.attempt_id
+		WHERE e.tenant_id=$1 AND e.id=$2 FOR UPDATE OF a`, tenantID, effectID).
+		Scan(&attemptID, &taskID, &runID, &agentID, &attemptStatus)
+	if err != nil {
+		return mapReadError("读取拒绝关联 Attempt", err)
+	}
+	if attemptStatus != "WAITING" {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	command, err := tx.Exec(ctx, `
+		UPDATE task_attempts
+		SET status='ABORTED',finished_at=$3,error_code=$4,
+		    error_message=$5,updated_at=$3
+		WHERE tenant_id=$1 AND id=$2 AND status='WAITING'`,
+		tenantID, attemptID, now, failureCode, reason)
+	if err != nil {
+		return mapWriteError("终止被拒绝 Attempt", err)
+	}
+	if command.RowsAffected() != 1 {
+		return fmt.Errorf("%w: 待拒绝 Attempt 已变化", safetycontrol.ErrVersionConflict)
+	}
+	var taskVersion int64
+	err = tx.QueryRow(ctx, `
+		UPDATE tasks
+		SET status='FAILED',assigned_agent_id=NULL,version=version+1,updated_at=$5
+		WHERE tenant_id=$1 AND id=$2 AND swarm_id=$3 AND status=$6
+		  AND assigned_agent_id=$4 RETURNING version`,
+		tenantID, taskID, runID, agentID, now, waitingTaskStatus).Scan(&taskVersion)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: 待拒绝 Task 已变化", safetycontrol.ErrVersionConflict)
+		}
+		return mapWriteError("拒绝审批 Task", err)
+	}
+	var agentVersion int64
+	err = tx.QueryRow(ctx, `
+		UPDATE agent_instances
+		SET status='IDLE',current_task_id=NULL,load=0,version=version+1,updated_at=$4
+		WHERE tenant_id=$1 AND id=$2 AND status='WAITING_TOOL' AND current_task_id=$3
+		RETURNING version`, tenantID, agentID, taskID, now).Scan(&agentVersion)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return mapWriteError("释放被拒绝 Agent", err)
+	}
+	if err := insertTenantOutbox(ctx, tx, tenantID, "attempt", attemptID,
+		"attempt.aborted", 2, map[string]any{
+			"id": attemptID, "run_id": runID, "task_id": taskID,
+			"reason": reasonCode,
+		}); err != nil {
+		return err
+	}
+	if err := insertTenantOutbox(ctx, tx, tenantID, "task", taskID, "task.failed",
+		taskVersion, map[string]any{
+			"id": taskID, "run_id": runID, "attempt_id": attemptID,
+			"reason": reason, "version": taskVersion,
+		}); err != nil {
+		return err
+	}
+	if err == nil {
+		if err := insertTenantOutbox(ctx, tx, tenantID, "agent_instance", agentID,
+			"agent.idle", agentVersion, map[string]any{
+				"id": agentID, "run_id": runID, "reason": reasonCode,
+				"version": agentVersion,
+			}); err != nil {
+			return err
+		}
+	}
+	_, err = failRunForTask(ctx, tx, tenantID, runID, taskID, attemptID,
+		failureCode, reason, now)
+	return err
 }
 
 const interactionViewSelect = `
@@ -490,8 +695,26 @@ func (r *Repository) TransitionEffect(ctx context.Context, record safetycontrol.
 	if record.Mutation.AggregateID != record.EffectID {
 		return nil, fmt.Errorf("%w: Effect 与幂等聚合 ID 不一致", safetycontrol.ErrInvalidStoreResult)
 	}
+	if record.ResumeWaitingAttempt && record.FailWaitingAttempt {
+		return nil, fmt.Errorf("%w: 对账不能同时恢复和终止 Attempt", safetycontrol.ErrInvalidStoreResult)
+	}
+	// 保留顶层 result 以兼容既有 Effect 读模型，同时把最终结论与支撑证据
+	// 封装到 reconciliation，避免与 Adapter 原始返回或 _authorization 审批证据混淆。
+	// sanitizeEffectValue 仍是最后一道密钥脱敏边界。
+	resultPatch, err := marshalJSON(map[string]any{
+		"result": sanitizeEffectValue(record.Result),
+		"reconciliation": map[string]any{
+			"outcome":  record.NextStatus,
+			"result":   sanitizeEffectValue(record.Result),
+			"evidence": sanitizeEffectValue(record.Evidence),
+			"reason":   record.Reason,
+		},
+	}, "effect.reconcile_result")
+	if err != nil {
+		return nil, err
+	}
 	var result *safetycontrol.EffectView
-	err := r.withTx(ctx, func(tx pgx.Tx) error {
+	err = r.withTx(ctx, func(tx pgx.Tx) error {
 		replay, err := beginSafetyMutation(ctx, tx, record.Mutation)
 		if err != nil {
 			return err
@@ -504,12 +727,27 @@ func (r *Repository) TransitionEffect(ctx context.Context, record safetycontrol.
 			return nil
 		}
 		command, err := tx.Exec(ctx, `
-			UPDATE effects SET status=$5,version=version+1,updated_at=$6,
-				reconcile_after=CASE WHEN $5='RECONCILING' THEN NULL ELSE reconcile_after END
-			WHERE tenant_id=$1 AND id=$2 AND version=$3 AND status=$4
+			UPDATE effects SET status=$5::varchar,version=version+1,updated_at=$6::timestamptz,
+				reconcile_after=CASE
+					WHEN $5::varchar='RECONCILING' THEN NULL
+					WHEN $5::varchar='UNKNOWN' THEN $6::timestamptz + interval '30 seconds'
+					ELSE reconcile_after END,
+				sanitized_result=CASE WHEN $5::varchar IN ('SUCCEEDED','FAILED')
+					THEN COALESCE(sanitized_result,'{}'::jsonb) || $7::jsonb
+					ELSE sanitized_result END,
+				external_ref=CASE WHEN $5::varchar IN ('SUCCEEDED','FAILED')
+					THEN COALESCE(NULLIF($8::text,''),external_ref) ELSE external_ref END,
+				finished_at=CASE WHEN $5::varchar IN ('SUCCEEDED','FAILED')
+					THEN $6::timestamptz ELSE finished_at END,
+				error_code=CASE WHEN $5::varchar='FAILED' THEN 'RECONCILED_FAILED'
+					WHEN $5::varchar='SUCCEEDED' THEN NULL ELSE error_code END,
+				error_message=CASE WHEN $5::varchar='FAILED' THEN NULLIF($9::text,'')
+					WHEN $5::varchar='SUCCEEDED' THEN NULL ELSE error_message END
+			WHERE tenant_id=$1 AND id=$2 AND version=$3 AND status=$4::varchar
 			  AND COALESCE(sanitized_result #>> '{_authorization,blocked}','false')<>'true'`,
 			record.Mutation.TenantID, record.EffectID, record.ExpectedVersion,
-			record.ExpectedStatus, record.NextStatus, record.Mutation.OccurredAt)
+			record.ExpectedStatus, record.NextStatus, record.Mutation.OccurredAt,
+			resultPatch, record.ExternalRef, record.Reason)
 		if err != nil {
 			return mapWriteError("转换 Effect", err)
 		}
@@ -527,6 +765,31 @@ func (r *Repository) TransitionEffect(ctx context.Context, record safetycontrol.
 				"to": record.NextStatus, "reason": record.Reason, "actor": record.Mutation.Actor,
 			}); err != nil {
 			return err
+		}
+		if record.ResumeWaitingAttempt {
+			if err := resumeWaitingAttemptAfterReconcile(ctx, tx, record.Mutation.TenantID,
+				record.EffectID, record.Mutation.OccurredAt); err != nil {
+				return err
+			}
+		}
+		if record.FailWaitingAttempt {
+			// UNKNOWN 期间稳定 ToolCall 保持 STARTED；只有外部对账明确 FAILED，才与
+			// Effect/Attempt/Task 的失败在同一事务内收口，保留原始错误并追加结论。
+			if _, err := tx.Exec(ctx, `
+				UPDATE tool_calls tc
+				SET status='FAILED',error_message=COALESCE(NULLIF($3,''),e.error_message),
+				    finished_at=$4
+				FROM effects e
+				WHERE e.tenant_id=$1 AND e.id=$2 AND tc.id=e.tool_call_id
+				  AND tc.attempt_id=e.attempt_id AND tc.status='STARTED'`,
+				record.Mutation.TenantID, record.EffectID, record.Reason,
+				record.Mutation.OccurredAt); err != nil {
+				return mapWriteError("结束对账失败 ToolCall", err)
+			}
+			if err := failWaitingAttemptAfterReconcile(ctx, tx, record.Mutation.TenantID,
+				record.EffectID, record.Reason, record.Mutation.OccurredAt); err != nil {
+				return err
+			}
 		}
 		return finishSafetyMutation(ctx, tx, record.Mutation, &safetycontrol.MutationResult{
 			Operation: record.Mutation.Operation, Effect: result,

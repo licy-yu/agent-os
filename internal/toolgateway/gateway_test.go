@@ -68,7 +68,7 @@ func (a *countingAdapter) Call(context.Context, *Definition, map[string]any) (ma
 	return map[string]any{"external_ref": "change-1"}, nil
 }
 
-func (s *memoryToolStore) GetToolDefinition(context.Context, string) (*Definition, error) {
+func (s *memoryToolStore) GetToolDefinition(context.Context, execution.AttemptOwner, string) (*Definition, error) {
 	return s.definition, nil
 }
 func (s *memoryToolStore) BeginToolCall(_ context.Context, owner execution.AttemptOwner, value CallRecord, _ int32) error {
@@ -134,9 +134,10 @@ func TestGatewayFailsClosedForUnknownRiskZone(t *testing.T) {
 
 func TestR3ApprovalPendingNeverCallsAdapter(t *testing.T) {
 	interactionID := uuid.New()
+	effectID := uuid.New()
 	store := &memoryToolStore{
 		definition: &Definition{Name: "deploy", Adapter: "native", RiskLevel: "production", Enabled: true},
-		permit: &EffectPermit{EffectID: uuid.New(), InteractionID: &interactionID,
+		permit: &EffectPermit{EffectID: effectID, InteractionID: &interactionID,
 			Disposition: EffectApprovalPending, Status: effect.StatusPrepared},
 	}
 	adapter := new(countingAdapter)
@@ -147,6 +148,7 @@ func TestR3ApprovalPendingNeverCallsAdapter(t *testing.T) {
 		"idempotency_key": "run-1/task-1/deploy", "target": "production",
 	})
 	require.ErrorIs(t, err, ErrApprovalPending)
+	require.Equal(t, effectID, WaitingEffectID(err))
 	require.Zero(t, adapter.calls)
 	require.Len(t, store.effectCalls, 1)
 	require.Equal(t, effect.RiskR3ProductionDestructive, store.effectCalls[0].RiskLevel)
@@ -208,9 +210,10 @@ func TestR2AuthorizedEffectPersistsExecutionBoundary(t *testing.T) {
 }
 
 func TestAdapterErrorPersistsUnknownAndStopsDirectRetry(t *testing.T) {
+	effectID := uuid.New()
 	store := &memoryToolStore{
 		definition: &Definition{Name: "deploy", Adapter: "native", RiskLevel: "production", Enabled: true},
-		permit:     &EffectPermit{EffectID: uuid.New(), Disposition: EffectExecute, Status: effect.StatusAuthorized},
+		permit:     &EffectPermit{EffectID: effectID, Disposition: EffectExecute, Status: effect.StatusAuthorized},
 	}
 	adapter := &countingAdapter{err: errors.New("connection reset after request write")}
 	gateway := New(store, gatewayWork([]string{"deploy"}, nil, "production"), map[string]Adapter{
@@ -220,7 +223,9 @@ func TestAdapterErrorPersistsUnknownAndStopsDirectRetry(t *testing.T) {
 		"idempotency_key": "run-1/task-1/deploy", "target": "production",
 	})
 	require.ErrorIs(t, err, ErrEffectReconcileRequired)
+	require.Equal(t, effectID, WaitingEffectID(err))
 	require.Equal(t, 1, adapter.calls)
+	require.Zero(t, store.finished, "UNKNOWN 期间 ToolCall 必须保持 STARTED")
 	require.Len(t, store.completions, 1)
 	require.Equal(t, effect.StatusUnknown, store.completions[0].Status)
 }

@@ -6,6 +6,7 @@ import (
 	stdErrors "errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	kratosErrors "github.com/go-kratos/kratos/v2/errors"
 	"github.com/go-kratos/kratos/v2/log"
@@ -33,7 +34,7 @@ import (
 func NewHTTPServer(cfg conf.ServerConfig, security conf.SecurityConfig,
 	svc *service.ControlPlaneService, runSvc *runcontrol.Service,
 	safetySvc *safetycontrol.Service, consoleSvc *consoleview.Service,
-	telemetry *observability.Telemetry, logger log.Logger,
+	readiness ReadinessProbe, telemetry *observability.Telemetry, logger log.Logger,
 ) *khttp.Server {
 	middlewares := []middleware.Middleware{recovery.Recovery()}
 	middlewares = append(middlewares, telemetry.Middlewares()...)
@@ -56,6 +57,19 @@ func NewHTTPServer(cfg conf.ServerConfig, security conf.SecurityConfig,
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte(reply.Status + "\n"))
+	})
+	// healthz 保留轻量进程/数据库兼容检查；readyz 额外验证调度和 Durable Runtime
+	// 的全部关键依赖。Compose 只在 readyz 通过后启动普通 Worker，避免半就绪接单。
+	srv.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		probeCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if readiness == nil || readiness(probeCtx) != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("unavailable\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ready\n"))
 	})
 	srv.Handle("/metrics", telemetry.MetricsHandler())
 

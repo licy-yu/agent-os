@@ -71,6 +71,10 @@ func (DeterministicExecutor) Execute(ctx context.Context, work *execution.Work,
 		checks[name] = true
 	}
 	output := map[string]any{
+		// output 是默认 V1.5 Plan 的稳定交付字段；summary/goal/tool_result 继续
+		// 保留给控制台和旧 E2E。两个内置执行器必须遵守同一最小输出合同，
+		// 否则默认 JSON_SCHEMA Gate 会把真实成功误判为缺少 required 字段。
+		"output":  "确定性执行器已完成任务",
 		"summary": "确定性执行器已完成任务", "goal": work.Task.Goal, "tool_result": toolResult,
 	}
 	if err := checkpoints.Save(ctx, "completed", map[string]any{"checks": checks, "output": output}, nil); err != nil {
@@ -134,7 +138,9 @@ func (e *OpenAIExecutor) Execute(ctx context.Context, work *execution.Work,
 	// 构建、测试和安全检查必须由相应工具产生证据，不能根据模型自述伪造为通过。
 	cost := (response.Usage.InputTokens + response.Usage.OutputTokens) * work.Template.CostPer1KTokensMicros / 1000
 	return execution.ExecutionResult{
-		Output: map[string]any{"text": text, "response_id": response.ID},
+		// output 与默认 Plan 的 AcceptanceGate 对齐；text 是面向现有客户端的
+		// 兼容字段。这里保存模型真实返回，不根据自然语言伪造任何测试证据。
+		Output: map[string]any{"output": text, "text": text, "response_id": response.ID},
 		Checks: checks, QualityScore: 0.85,
 		TokensIn: response.Usage.InputTokens, TokensOut: response.Usage.OutputTokens, CostMicros: cost,
 	}, nil

@@ -69,6 +69,13 @@ func persistCandidateVerification(ctx context.Context, tx pgx.Tx, attempt *execu
 	}
 	verificationResult := result
 	verificationResult.Output = normalizedOutput
+	// Runtime 已把原始错误归一化成 FailureClass/RecoveryAction/RetryLevel。
+	// 失败账本与候选产物共用当前事务，保证 Reviewer 不会看到只有失败输出、
+	// 却缺少可恢复策略事实的中间状态。
+	if err := persistRuntimeFailureRecord(ctx, tx, tenantID, runID, attempt.TaskID,
+		attempt.ID, normalizedOutput); err != nil {
+		return closure, err
+	}
 	policyViolations, err := collectDeterministicPolicyViolations(
 		ctx, tx, attempt.ID, sideEffectPolicyRaw, result.PolicyViolations,
 	)

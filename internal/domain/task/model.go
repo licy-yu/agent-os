@@ -13,21 +13,23 @@ import (
 type Status string
 
 const (
-	StatusCreated      Status = "CREATED"
-	StatusPlanning     Status = "PLANNING"
-	StatusBlocked      Status = "BLOCKED"
-	StatusReady        Status = "READY"
-	StatusScheduling   Status = "SCHEDULING"
-	StatusAssigned     Status = "ASSIGNED"
-	StatusRunning      Status = "RUNNING"
-	StatusWaitingTool  Status = "WAITING_TOOL"
-	StatusWaitingInput Status = "WAITING_INPUT"
-	StatusReview       Status = "REVIEW"
-	StatusRetryWait    Status = "RETRY_WAIT"
-	StatusSucceeded    Status = "SUCCEEDED"
-	StatusFailed       Status = "FAILED"
-	StatusCanceled     Status = "CANCELED"
-	StatusRejected     Status = "REJECTED"
+	StatusCreated         Status = "CREATED"
+	StatusPlanning        Status = "PLANNING"
+	StatusBlocked         Status = "BLOCKED"
+	StatusReady           Status = "READY"
+	StatusScheduling      Status = "SCHEDULING"
+	StatusAssigned        Status = "ASSIGNED"
+	StatusRunning         Status = "RUNNING"
+	StatusWaitingTool     Status = "WAITING_TOOL"
+	StatusWaitingInput    Status = "WAITING_INPUT"
+	StatusWaitingApproval Status = "WAITING_APPROVAL"
+	StatusWaitingExternal Status = "WAITING_EXTERNAL"
+	StatusReview          Status = "REVIEW"
+	StatusRetryWait       Status = "RETRY_WAIT"
+	StatusSucceeded       Status = "SUCCEEDED"
+	StatusFailed          Status = "FAILED"
+	StatusCanceled        Status = "CANCELED"
+	StatusRejected        Status = "REJECTED"
 )
 
 // Actor 表示有权发起特定状态转换的系统组件。
@@ -115,25 +117,29 @@ type transitionKey struct {
 
 // taskTransitions 同时约束“从哪里到哪里”和“谁有权修改”。
 var taskTransitions = map[transitionKey]bool{
-	{ActorPlanner, StatusCreated, StatusPlanning}:      true,
-	{ActorPlanner, StatusPlanning, StatusBlocked}:      true,
-	{ActorPlanner, StatusPlanning, StatusReady}:        true,
-	{ActorController, StatusBlocked, StatusReady}:      true,
-	{ActorController, StatusRetryWait, StatusReady}:    true,
-	{ActorScheduler, StatusReady, StatusScheduling}:    true,
-	{ActorScheduler, StatusScheduling, StatusAssigned}: true,
-	{ActorScheduler, StatusScheduling, StatusReady}:    true,
-	{ActorWorker, StatusAssigned, StatusRunning}:       true,
-	{ActorWorker, StatusRunning, StatusWaitingTool}:    true,
-	{ActorWorker, StatusWaitingTool, StatusRunning}:    true,
-	{ActorWorker, StatusRunning, StatusWaitingInput}:   true,
-	{ActorWorker, StatusWaitingInput, StatusRunning}:   true,
-	{ActorWorker, StatusRunning, StatusReview}:         true,
-	{ActorReviewer, StatusReview, StatusSucceeded}:     true,
-	{ActorReviewer, StatusReview, StatusRetryWait}:     true,
-	{ActorReviewer, StatusReview, StatusFailed}:        true,
-	{ActorRecovery, StatusRunning, StatusRetryWait}:    true,
-	{ActorRecovery, StatusRunning, StatusFailed}:       true,
+	{ActorPlanner, StatusCreated, StatusPlanning}:        true,
+	{ActorPlanner, StatusPlanning, StatusBlocked}:        true,
+	{ActorPlanner, StatusPlanning, StatusReady}:          true,
+	{ActorController, StatusBlocked, StatusReady}:        true,
+	{ActorController, StatusRetryWait, StatusReady}:      true,
+	{ActorScheduler, StatusReady, StatusScheduling}:      true,
+	{ActorScheduler, StatusScheduling, StatusAssigned}:   true,
+	{ActorScheduler, StatusScheduling, StatusReady}:      true,
+	{ActorWorker, StatusAssigned, StatusRunning}:         true,
+	{ActorWorker, StatusRunning, StatusWaitingTool}:      true,
+	{ActorWorker, StatusWaitingTool, StatusRunning}:      true,
+	{ActorWorker, StatusRunning, StatusWaitingInput}:     true,
+	{ActorWorker, StatusWaitingInput, StatusRunning}:     true,
+	{ActorWorker, StatusRunning, StatusWaitingApproval}:  true,
+	{ActorWorker, StatusWaitingApproval, StatusAssigned}: true,
+	{ActorWorker, StatusRunning, StatusWaitingExternal}:  true,
+	{ActorWorker, StatusWaitingExternal, StatusAssigned}: true,
+	{ActorWorker, StatusRunning, StatusReview}:           true,
+	{ActorReviewer, StatusReview, StatusSucceeded}:       true,
+	{ActorReviewer, StatusReview, StatusRetryWait}:       true,
+	{ActorReviewer, StatusReview, StatusFailed}:          true,
+	{ActorRecovery, StatusRunning, StatusRetryWait}:      true,
+	{ActorRecovery, StatusRunning, StatusFailed}:         true,
 }
 
 // Transition 执行受角色约束的状态转换。

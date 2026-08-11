@@ -46,6 +46,18 @@ func (g *Gateway) Ready() bool {
 	return g != nil && g.client != nil && strings.TrimSpace(g.taskQueue) != ""
 }
 
+// Ping 供 HTTP readiness 探针做真实 gRPC 健康检查。Ready 只说明 Client 已构造，
+// Temporal Server 后续失联时必须由 CheckHealth 暴露给滚动发布和运维脚本。
+func (g *Gateway) Ping(ctx context.Context) error {
+	if !g.Ready() {
+		return fmt.Errorf("Temporal Gateway 未就绪")
+	}
+	if _, err := g.client.CheckHealth(ctx, nil); err != nil {
+		return fmt.Errorf("Temporal CheckHealth: %w", err)
+	}
+	return nil
+}
+
 // StartRun 使用 RejectDuplicate，保证同一个业务 Run 永远不会误启动第二条 Workflow。
 func (g *Gateway) StartRun(ctx context.Context, view *runcontrol.RunView) (runcontrol.WorkflowRef, error) {
 	if !g.Ready() || view == nil {

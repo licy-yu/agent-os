@@ -18,6 +18,7 @@ func (r *Repository) ListReconcileTasks(ctx context.Context, limit int) ([]*task
 	rows, err := r.pool.Query(ctx, taskSelect+`
 		JOIN swarms run_scope ON run_scope.id=t.swarm_id
 		WHERE t.status IN ('CREATED','PLANNING','BLOCKED','RETRY_WAIT')
+		  AND t.tenant_id=run_scope.tenant_id
 		  AND run_scope.desired_state='RUNNING'
 		  AND run_scope.status IN ('PENDING','RUNNING')
 		ORDER BY t.updated_at,t.id
@@ -62,19 +63,21 @@ func (r *Repository) DependenciesSatisfied(ctx context.Context, taskID uuid.UUID
 func (r *Repository) TransitionTask(ctx context.Context, id uuid.UUID, expectedVersion int64, from, to task.Status, eventType string) (int64, error) {
 	var nextVersion int64
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
+		var tenantID, runID uuid.UUID
 		err := tx.QueryRow(ctx, `
 			UPDATE tasks
 			SET status=$4,version=version+1,updated_at=now()
 			WHERE id=$1 AND version=$2 AND status=$3
-			RETURNING version`, id, expectedVersion, from, to).Scan(&nextVersion)
+			RETURNING version,tenant_id,swarm_id`, id, expectedVersion, from, to).
+			Scan(&nextVersion, &tenantID, &runID)
 		if err == pgx.ErrNoRows {
 			return fmt.Errorf("%w: task %s 已被其他控制器修改", domain.ErrConflict, id)
 		}
 		if err != nil {
 			return fmt.Errorf("更新 task 状态: %w", err)
 		}
-		return insertOutbox(ctx, tx, "task", id, eventType, nextVersion, map[string]any{
-			"id": id, "from": from, "to": to, "version": nextVersion,
+		return insertTenantOutbox(ctx, tx, tenantID, "task", id, eventType, nextVersion, map[string]any{
+			"id": id, "run_id": runID, "from": from, "to": to, "version": nextVersion,
 		})
 	})
 	return nextVersion, err
@@ -85,7 +88,7 @@ func (r *Repository) ActivateRegisteredAgents(ctx context.Context, limit int) (i
 	count := 0
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT id,version FROM agent_instances
+			SELECT id,tenant_id,version FROM agent_instances
 			WHERE status='REGISTERED'
 			ORDER BY created_at,id
 			FOR UPDATE SKIP LOCKED
@@ -94,13 +97,13 @@ func (r *Repository) ActivateRegisteredAgents(ctx context.Context, limit int) (i
 			return fmt.Errorf("锁定 REGISTERED agents: %w", err)
 		}
 		type lockedAgent struct {
-			id      uuid.UUID
-			version int64
+			id, tenantID uuid.UUID
+			version      int64
 		}
 		locked := make([]lockedAgent, 0, limit)
 		for rows.Next() {
 			var value lockedAgent
-			if err := rows.Scan(&value.id, &value.version); err != nil {
+			if err := rows.Scan(&value.id, &value.tenantID, &value.version); err != nil {
 				rows.Close()
 				return err
 			}
@@ -123,7 +126,7 @@ func (r *Repository) ActivateRegisteredAgents(ctx context.Context, limit int) (i
 			if result.RowsAffected() != 1 {
 				continue
 			}
-			if err := insertOutbox(ctx, tx, "agent_instance", value.id, "agent.idle", value.version+1, map[string]any{
+			if err := insertTenantOutbox(ctx, tx, value.tenantID, "agent_instance", value.id, "agent.idle", value.version+1, map[string]any{
 				"id": value.id, "from": agent.StatusRegistered, "to": agent.StatusIdle,
 			}); err != nil {
 				return err
@@ -147,6 +150,7 @@ func (r *Repository) ListQueuedTasks(ctx context.Context, limit int) ([]orchestr
 		           AND child.status NOT IN ('SUCCEEDED','FAILED','CANCELED','REJECTED')) AS blocked_children
 		FROM tasks t JOIN swarms run_scope ON run_scope.id=t.swarm_id
 		WHERE t.status='READY' AND t.available_at <= now()
+		  AND t.tenant_id=run_scope.tenant_id
 		  AND run_scope.desired_state='RUNNING'
 		  AND run_scope.status IN ('PENDING','RUNNING')
 		ORDER BY t.priority DESC,t.created_at
@@ -180,7 +184,8 @@ func (r *Repository) ListSchedulerCandidates(ctx context.Context, swarmID uuid.U
 		FROM agent_instances ai
 		JOIN agent_templates at ON at.id=ai.template_id
 		JOIN swarms s ON s.id=$1
-		WHERE (ai.swarm_id IS NULL OR ai.swarm_id=$1)
+		WHERE ai.tenant_id=s.tenant_id AND at.tenant_id=s.tenant_id
+		  AND (ai.swarm_id IS NULL OR ai.swarm_id=$1)
 		ORDER BY ai.load,ai.created_at`, swarmID, taskMaxTokens)
 	if err != nil {
 		return nil, fmt.Errorf("查询 scheduler candidates: %w", err)
@@ -262,6 +267,12 @@ func (r *Repository) RecordSchedulerDecision(ctx context.Context, decision orche
 // BindTask 原子地把 Task 和 Agent 互相绑定；任一 CAS 失败都会整体回滚。
 func (r *Repository) BindTask(ctx context.Context, taskID uuid.UUID, taskVersion int64, agentID uuid.UUID, agentVersion int64) error {
 	return r.withTx(ctx, func(tx pgx.Tx) error {
+		var tenantID, runID uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT tenant_id,swarm_id FROM tasks WHERE id=$1 AND version=$2 FOR UPDATE`,
+			taskID, taskVersion).Scan(&tenantID, &runID); err != nil {
+			return mapReadError("锁定 BindTask 租户", err)
+		}
 		var nextTaskVersion int64
 		err := tx.QueryRow(ctx, `
 			UPDATE tasks
@@ -279,8 +290,8 @@ func (r *Repository) BindTask(ctx context.Context, taskID uuid.UUID, taskVersion
 		err = tx.QueryRow(ctx, `
 			UPDATE agent_instances
 			SET status='RESERVED',current_task_id=$3,version=version+1,updated_at=now()
-			WHERE id=$1 AND version=$2 AND status='IDLE'
-			RETURNING version`, agentID, agentVersion, taskID).Scan(&nextAgentVersion)
+			WHERE id=$1 AND version=$2 AND status='IDLE' AND tenant_id=$4
+			RETURNING version`, agentID, agentVersion, taskID, tenantID).Scan(&nextAgentVersion)
 		if err == pgx.ErrNoRows {
 			return fmt.Errorf("%w: agent %s 已不在 IDLE", domain.ErrConflict, agentID)
 		}
@@ -288,13 +299,13 @@ func (r *Repository) BindTask(ctx context.Context, taskID uuid.UUID, taskVersion
 			return fmt.Errorf("CAS reserve agent: %w", err)
 		}
 
-		if err := insertOutbox(ctx, tx, "task", taskID, "task.assigned", nextTaskVersion, map[string]any{
-			"id": taskID, "agent_id": agentID, "version": nextTaskVersion,
+		if err := insertTenantOutbox(ctx, tx, tenantID, "task", taskID, "task.assigned", nextTaskVersion, map[string]any{
+			"id": taskID, "run_id": runID, "agent_id": agentID, "version": nextTaskVersion,
 		}); err != nil {
 			return err
 		}
-		return insertOutbox(ctx, tx, "agent_instance", agentID, "agent.reserved", nextAgentVersion, map[string]any{
-			"id": agentID, "task_id": taskID, "version": nextAgentVersion,
+		return insertTenantOutbox(ctx, tx, tenantID, "agent_instance", agentID, "agent.reserved", nextAgentVersion, map[string]any{
+			"id": agentID, "run_id": runID, "task_id": taskID, "version": nextAgentVersion,
 		})
 	})
 }

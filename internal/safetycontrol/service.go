@@ -340,12 +340,14 @@ func (s *Service) resolveInteraction(ctx context.Context, id uuid.UUID, idempote
 				ExpectedStatus: linked.Status, NextStatus: effectAggregate.Status,
 				ApprovedBy: principal.Subject, ApprovedAt: now,
 			}
+			record.ResumeWaitingAttempt = true
 		} else {
 			record.Rejection = &EffectRejection{
 				EffectID: linked.ID, ExpectedEffectVersion: linked.Version,
 				ExpectedStatus: linked.Status, RejectedBy: principal.Subject,
 				RejectedAt: now, Reason: rejectionReason(request.Resolution),
 			}
+			record.FailWaitingAttempt = true
 		}
 	}
 
@@ -502,14 +504,46 @@ func (s *Service) GetEffect(ctx context.Context, id uuid.UUID) (*EffectView, err
 	return item, nil
 }
 
-// Reconcile 严格执行 UNKNOWN -> RECONCILING；它只启动对账，绝不能重新调用原 Execute。
+// Reconcile 第一次严格执行 UNKNOWN -> RECONCILING；之后必须根据外部系统查询证据
+// 提交 SUCCEEDED/FAILED/UNKNOWN。整个过程绝不能重新调用原 Execute。
 func (s *Service) Reconcile(ctx context.Context, id uuid.UUID, idempotencyKey string, request EffectCommandRequest) (*EffectView, error) {
+	request.Reason = strings.TrimSpace(request.Reason)
+	request.ExternalRef = strings.TrimSpace(request.ExternalRef)
+	next := effect.StatusReconciling
+	if request.Outcome != "" {
+		request.Outcome = effect.Status(strings.ToUpper(strings.TrimSpace(string(request.Outcome))))
+		switch request.Outcome {
+		case effect.StatusSucceeded, effect.StatusFailed:
+			next = request.Outcome
+			// 终态不能只是人工输入的一个枚举值；必须附带可机读、可哈希、
+			// 可持久化的客观证据。Result 可以为空（例如外部失败无业务返回），
+			// Evidence 则不能为空。
+			if err := validateReconcileEvidence(request.Result, request.Evidence); err != nil {
+				return nil, err
+			}
+		case effect.StatusUnknown:
+			next = request.Outcome
+			// UNKNOWN 代表“仍无法确认”，不伪造确定性证据；但必须说明为什么
+			// 本次无法收敛，方便设定下次对账时间和人工排查。
+			if request.Reason == "" {
+				return nil, fmt.Errorf("%w: UNKNOWN 对账结论必须包含 reason", ErrInvalidRequest)
+			}
+		default:
+			return nil, fmt.Errorf("%w: reconcile outcome 只能为 SUCCEEDED/FAILED/UNKNOWN", ErrInvalidRequest)
+		}
+	} else if len(request.Result) > 0 || len(request.Evidence) > 0 || request.ExternalRef != "" {
+		return nil, fmt.Errorf("%w: 启动对账时不接受终态 result/evidence/externalRef", ErrInvalidRequest)
+	}
 	return s.transitionEffect(ctx, id, idempotencyKey, request, ScopeEffectReconcile,
-		operationEffectReconcile, effect.StatusReconciling)
+		operationEffectReconcile, next)
 }
 
 // Compensate 严格执行 SUCCEEDED -> COMPENSATING；最终 COMPENSATED 只能由外部补偿确认路径写入。
 func (s *Service) Compensate(ctx context.Context, id uuid.UUID, idempotencyKey string, request EffectCommandRequest) (*EffectView, error) {
+	if request.Outcome != "" || len(request.Result) > 0 || len(request.Evidence) > 0 ||
+		strings.TrimSpace(request.ExternalRef) != "" {
+		return nil, fmt.Errorf("%w: compensate 不接受 reconcile outcome/result/evidence", ErrInvalidRequest)
+	}
 	return s.transitionEffect(ctx, id, idempotencyKey, request, ScopeEffectCompensate,
 		operationEffectCompensate, effect.StatusCompensating)
 }
@@ -522,6 +556,7 @@ func (s *Service) transitionEffect(ctx context.Context, id uuid.UUID, idempotenc
 		return nil, err
 	}
 	request.Reason = strings.TrimSpace(request.Reason)
+	request.ExternalRef = strings.TrimSpace(request.ExternalRef)
 	if id == uuid.Nil || request.Version <= 0 {
 		return nil, fmt.Errorf("%w: effect id 和正版本号不能为空", ErrInvalidRequest)
 	}
@@ -546,6 +581,10 @@ func (s *Service) transitionEffect(ctx context.Context, id uuid.UUID, idempotenc
 	if current.AuthorizationBlocked {
 		return nil, fmt.Errorf("%w: %s", ErrApprovalRequired, current.AuthorizationBlockReason)
 	}
+	if (next == effect.StatusSucceeded || next == effect.StatusFailed) &&
+		request.ExternalRef == "" && strings.TrimSpace(current.ExternalRef) == "" {
+		return nil, fmt.Errorf("%w: SUCCEEDED/FAILED 对账结论必须包含 externalRef，或 Effect 账本已有 externalRef", ErrInvalidRequest)
+	}
 	if current.RiskLevel == effect.RiskR3ProductionDestructive &&
 		(current.ApprovalInteractionID == nil || strings.TrimSpace(current.ApprovedBy) == "") {
 		return nil, ErrApprovalRequired
@@ -560,7 +599,12 @@ func (s *Service) transitionEffect(ctx context.Context, id uuid.UUID, idempotenc
 	}
 	updated, err := s.store.TransitionEffect(ctx, TransitionEffectRecord{
 		EffectID: id, ExpectedStatus: current.Status, NextStatus: aggregate.Status,
-		ExpectedVersion: current.Version, Reason: request.Reason, Mutation: metadata,
+		ExpectedVersion: current.Version, Reason: request.Reason, Result: request.Result,
+		Evidence:             request.Evidence,
+		ExternalRef:          request.ExternalRef,
+		ResumeWaitingAttempt: current.Status == effect.StatusReconciling && next == effect.StatusSucceeded,
+		FailWaitingAttempt:   current.Status == effect.StatusReconciling && next == effect.StatusFailed,
+		Mutation:             metadata,
 	})
 	if err != nil {
 		return nil, err
@@ -811,6 +855,28 @@ func validateJSONPayload(payload map[string]any) error {
 	}
 	if len(raw) > maximumPayloadSize {
 		return fmt.Errorf("%w: payload 不能超过 %d bytes", ErrInvalidRequest, maximumPayloadSize)
+	}
+	return nil
+}
+
+// validateReconcileEvidence 对最终对账证据做单一边界校验。把 result 与 evidence
+// 放在同一 JSON envelope 中计算上限，可以防止调用方通过拆分两个字段绕过
+// 64 KiB 审计载荷限制。encoding/json 会稳定排序 map key，同一结构也因此能
+// 参与 prepareMutation 的稳定幂等哈希。
+func validateReconcileEvidence(result, evidence map[string]any) error {
+	if len(evidence) == 0 {
+		return fmt.Errorf("%w: SUCCEEDED/FAILED 对账结论必须包含非空 evidence", ErrInvalidRequest)
+	}
+	envelope := struct {
+		Result   map[string]any `json:"result,omitempty"`
+		Evidence map[string]any `json:"evidence"`
+	}{Result: result, Evidence: evidence}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("%w: reconcile evidence/result 必须能编码为 JSON: %v", ErrInvalidRequest, err)
+	}
+	if len(raw) > maximumPayloadSize {
+		return fmt.Errorf("%w: reconcile evidence/result 不能超过 %d bytes", ErrInvalidRequest, maximumPayloadSize)
 	}
 	return nil
 }

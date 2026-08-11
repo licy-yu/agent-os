@@ -132,5 +132,11 @@ func NewRecoveryController(store execution.Store, timeout time.Duration) *Recove
 }
 
 func (c *RecoveryController) ReconcileOnce(ctx context.Context) (int, error) {
-	return c.store.RecoverTimedOut(ctx, time.Now().UTC().Add(-c.timeout), c.batch)
+	// 人工审批的等待时间远长于 Worker 心跳超时，因此两类回收必须使用不同的
+	// 时间边界：Interaction 按自身 expires_at 到期，RUNNING Attempt 才按心跳阈值
+	// 回收。即使其中一个存储操作暂时失败，也继续执行另一个，避免故障互相阻塞。
+	now := time.Now().UTC()
+	expired, expireErr := c.store.ExpireWaitingInteractions(ctx, now, c.batch)
+	recovered, recoverErr := c.store.RecoverTimedOut(ctx, now.Add(-c.timeout), c.batch)
+	return expired + recovered, errors.Join(expireErr, recoverErr)
 }

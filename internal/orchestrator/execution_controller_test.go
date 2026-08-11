@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,12 +14,23 @@ import (
 )
 
 type reviewStore struct {
-	work       *execution.Work
-	evaluation execution.Evaluation
+	work            *execution.Work
+	evaluation      execution.Evaluation
+	expired         int
+	recovered       int
+	expireErr       error
+	recoverErr      error
+	expireCalledAt  time.Time
+	recoverCalledAt time.Time
+	expireCalls     int
+	recoverCalls    int
 }
 
 func (s *reviewStore) ClaimWork(context.Context, uuid.UUID, uuid.UUID, string) (*execution.Work, error) {
 	return nil, nil
+}
+func (s *reviewStore) SuspendAttempt(context.Context, execution.AttemptOwner, execution.AttemptWait) error {
+	return nil
 }
 func (s *reviewStore) SaveCheckpoint(context.Context, execution.AttemptOwner, execution.Checkpoint) error {
 	return nil
@@ -34,7 +46,22 @@ func (s *reviewStore) ApplyReview(_ context.Context, _ *execution.Work, value ex
 	s.evaluation = value
 	return nil
 }
-func (s *reviewStore) RecoverTimedOut(context.Context, time.Time, int) (int, error) { return 0, nil }
+func (s *reviewStore) ExpireWaitingInteractions(_ context.Context, now time.Time, limit int) (int, error) {
+	s.expireCalls++
+	s.expireCalledAt = now
+	if limit != 100 {
+		return 0, errors.New("unexpected expiry batch")
+	}
+	return s.expired, s.expireErr
+}
+func (s *reviewStore) RecoverTimedOut(_ context.Context, cutoff time.Time, limit int) (int, error) {
+	s.recoverCalls++
+	s.recoverCalledAt = cutoff
+	if limit != 100 {
+		return 0, errors.New("unexpected recovery batch")
+	}
+	return s.recovered, s.recoverErr
+}
 
 func TestReviewerAcceptsOnlyPersistedEvidence(t *testing.T) {
 	policy := task.DefaultExecutionPolicy()
@@ -71,4 +98,39 @@ func TestReviewerRetriesMissingCheckBeforeAttemptLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, execution.DecisionRetry, store.evaluation.Decision)
 	require.False(t, store.evaluation.MachinePass)
+}
+
+func TestRecoveryExpiresInteractionsAndRecoversTimedOutAttempts(t *testing.T) {
+	t.Parallel()
+	store := &reviewStore{expired: 2, recovered: 3}
+	timeout := 90 * time.Second
+	before := time.Now().UTC()
+
+	changed, err := NewRecoveryController(store, timeout).ReconcileOnce(context.Background())
+	after := time.Now().UTC()
+
+	require.NoError(t, err)
+	require.Equal(t, 5, changed)
+	require.Equal(t, 1, store.expireCalls)
+	require.Equal(t, 1, store.recoverCalls)
+	require.False(t, store.expireCalledAt.Before(before))
+	require.False(t, store.expireCalledAt.After(after))
+	require.Equal(t, timeout, store.expireCalledAt.Sub(store.recoverCalledAt))
+}
+
+func TestRecoveryRunsBothClosuresAndJoinsErrors(t *testing.T) {
+	t.Parallel()
+	expireErr := errors.New("expire unavailable")
+	recoverErr := errors.New("recovery unavailable")
+	store := &reviewStore{
+		expired: 1, recovered: 2, expireErr: expireErr, recoverErr: recoverErr,
+	}
+
+	changed, err := NewRecoveryController(store, time.Minute).ReconcileOnce(context.Background())
+
+	require.Equal(t, 3, changed)
+	require.ErrorIs(t, err, expireErr)
+	require.ErrorIs(t, err, recoverErr)
+	require.Equal(t, 1, store.expireCalls)
+	require.Equal(t, 1, store.recoverCalls)
 }

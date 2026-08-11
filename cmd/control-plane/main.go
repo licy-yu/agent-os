@@ -95,7 +95,17 @@ func main() {
 	}
 	consoleSvc := consoleview.NewService(repository)
 	safetySvc := safetycontrol.NewService(repository)
-	httpServer := server.NewHTTPServer(cfg.Server, cfg.Security, svc, runSvc, safetySvc, consoleSvc, telemetry, logger)
+	dependencyProbes := []server.DependencyProbe{
+		{Name: "postgres", Check: repository.Ping},
+		{Name: "redis", Check: leaseManager.Ping},
+		{Name: "nats", Check: eventBus.Ping},
+	}
+	if temporalGateway != nil {
+		dependencyProbes = append(dependencyProbes,
+			server.DependencyProbe{Name: "temporal", Check: temporalGateway.Ping})
+	}
+	httpServer := server.NewHTTPServer(cfg.Server, cfg.Security, svc, runSvc, safetySvc, consoleSvc,
+		server.NewReadinessProbe(dependencyProbes...), telemetry, logger)
 	grpcServer := server.NewGRPCServer(cfg.Server, svc, telemetry, logger)
 	taskController := orchestrator.NewTaskController(repository, logger)
 	agentController := orchestrator.NewAgentController(repository)

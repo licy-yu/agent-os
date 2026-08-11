@@ -36,6 +36,41 @@ var (
 	ErrEffectReconcileRequired = errors.New("Effect 必须先对账")
 )
 
+// EffectWaitError 在保留 errors.Is 哨兵语义的同时，携带真正触发等待的 Effect ID。
+// Worker 把它传给持久化层，才能在“审批恰好先完成”的竞态窗口中检查同一条 Effect，
+// 而不是猜测 Attempt 下最近更新的其它副作用。
+type EffectWaitError struct {
+	Cause         error
+	EffectID      uuid.UUID
+	InteractionID *uuid.UUID
+	Status        effect.Status
+	Detail        string
+}
+
+func (e *EffectWaitError) Error() string {
+	if e == nil {
+		return "Effect 等待状态未知"
+	}
+	return fmt.Sprintf("%v: effect=%s status=%s interaction=%v detail=%s",
+		e.Cause, e.EffectID, e.Status, e.InteractionID, strings.TrimSpace(e.Detail))
+}
+
+func (e *EffectWaitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+// WaitingEffectID 从任意层级的包装错误中提取等待边界的 Effect ID。
+func WaitingEffectID(err error) uuid.UUID {
+	var wait *EffectWaitError
+	if errors.As(err, &wait) && wait != nil {
+		return wait.EffectID
+	}
+	return uuid.Nil
+}
+
 // Definition 是工具注册表的运行时视图。
 type Definition struct {
 	Name                string
@@ -106,7 +141,9 @@ type EffectCompletion struct {
 
 // Store 负责注册表读取、额度的原子预留以及审计记录完成。
 type Store interface {
-	GetToolDefinition(context.Context, string) (*Definition, error)
+	// GetToolDefinition 必须同时校验 Attempt owner，并只返回该 Attempt 租户的工具定义。
+	// 工具名不是跨租户授权凭据，绝不能仅凭模型传入的 name 查询全局注册表。
+	GetToolDefinition(context.Context, execution.AttemptOwner, string) (*Definition, error)
 	BeginToolCall(context.Context, execution.AttemptOwner, CallRecord, int32) error
 	FinishToolCall(context.Context, execution.AttemptOwner, uuid.UUID, string, map[string]any, string) error
 	PrepareToolEffect(context.Context, execution.AttemptOwner, EffectRequest) (*EffectPermit, error)
@@ -167,7 +204,7 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 	)
 	defer span.End()
 
-	definition, err := g.store.GetToolDefinition(ctx, name)
+	definition, err := g.store.GetToolDefinition(ctx, g.owner, name)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -221,7 +258,7 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 			return nil, err
 		}
 		// 同一 Effect 的至少一次重投必须命中同一 ToolCall 审计行，防止审批轮询消耗额度。
-		record.ID = stableToolCallID(effectRequest.IdempotencyKey, effectRequest.RequestHash)
+		record.ID = stableToolCallID(g.attemptID, effectRequest.IdempotencyKey, effectRequest.RequestHash)
 		effectRequest.ToolCallID = record.ID
 	}
 	if err := g.store.BeginToolCall(ctx, g.owner, record, g.maxCalls); err != nil {
@@ -237,11 +274,14 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 		}
 		switch permit.Disposition {
 		case EffectApprovalPending:
-			return nil, fmt.Errorf("%w: effect=%s interaction=%v", ErrApprovalPending,
-				permit.EffectID, permit.InteractionID)
+			return nil, &EffectWaitError{
+				Cause: ErrApprovalPending, EffectID: permit.EffectID,
+				InteractionID: permit.InteractionID, Status: permit.Status,
+			}
 		case EffectReconcileOnly:
-			return nil, fmt.Errorf("%w: effect=%s status=%s", ErrEffectReconcileRequired,
-				permit.EffectID, permit.Status)
+			return nil, &EffectWaitError{
+				Cause: ErrEffectReconcileRequired, EffectID: permit.EffectID, Status: permit.Status,
+			}
 		case EffectAlreadyDone:
 			if err := g.store.FinishToolCall(ctx, g.owner, record.ID, "SUCCEEDED", permit.Result, ""); err != nil {
 				return nil, err
@@ -268,11 +308,20 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 			finishErr := g.store.FinishToolEffect(ctx, g.owner, permit.EffectID, EffectCompletion{
 				Status: effect.StatusUnknown, ErrorMessage: callErr.Error(), FinishedAt: time.Now().UTC(),
 			})
-			_ = g.store.FinishToolCall(ctx, g.owner, record.ID, "FAILED", nil, callErr.Error())
+			// UNKNOWN 不是失败终态：稳定 ToolCall 必须保留 STARTED，待 Reconciler
+			// 确认 SUCCEEDED 后才能改为 SUCCEEDED；若确认失败，由对账事务原子写 FAILED。
+			// 原始错误已经保存在 Effect.error_message，不能为了日志便利破坏可恢复性。
 			if finishErr != nil {
-				return nil, fmt.Errorf("外部结果不确定且 Effect 落库失败: call=%v effect=%w", callErr, finishErr)
+				return nil, &EffectWaitError{
+					Cause: ErrEffectReconcileRequired, EffectID: permit.EffectID,
+					Status: effect.StatusExecuting,
+					Detail: fmt.Sprintf("adapter=%v; persist_unknown=%v", callErr, finishErr),
+				}
 			}
-			return nil, fmt.Errorf("%w: %v", ErrEffectReconcileRequired, callErr)
+			return nil, &EffectWaitError{
+				Cause: ErrEffectReconcileRequired, EffectID: permit.EffectID,
+				Status: effect.StatusUnknown, Detail: callErr.Error(),
+			}
 		}
 		externalRef, _ := result["external_ref"].(string)
 		if err := g.store.FinishToolEffect(ctx, g.owner, permit.EffectID, EffectCompletion{
@@ -346,8 +395,11 @@ func firstString(values map[string]any, keys ...string) string {
 	return ""
 }
 
-func stableToolCallID(key, requestHash string) uuid.UUID {
-	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("swarmos/tool-call/"+key+"/"+requestHash))
+func stableToolCallID(attemptID uuid.UUID, key, requestHash string) uuid.UUID {
+	// Attempt ID 隐含租户边界；同一租户/Attempt 的重放稳定，两个租户即使复用相同
+	// 业务幂等键也不会争用 tool_calls 的全局主键。
+	return uuid.NewSHA1(uuid.NameSpaceURL,
+		[]byte("swarmos/tool-call/"+attemptID.String()+"/"+key+"/"+requestHash))
 }
 
 func effectRiskLevel(value string) (effect.RiskLevel, bool) {

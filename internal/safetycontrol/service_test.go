@@ -139,6 +139,27 @@ func TestDTOUsesCamelCaseJSON(t *testing.T) {
 	if strings.Contains(encoded, "interaction_type") || strings.Contains(encoded, "tenant_id") {
 		t.Fatalf("DTO 不得暴露 snake_case: %s", encoded)
 	}
+
+	reconcileRaw, err := json.Marshal(EffectCommandRequest{
+		Version: 2, Outcome: effect.StatusSucceeded,
+		Result: map[string]any{"resourceState": "ready"},
+		Evidence: map[string]any{
+			"observedAt": "2026-08-11T09:30:00Z",
+		},
+		ExternalRef: "deployment-42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileJSON := string(reconcileRaw)
+	for _, expected := range []string{`"outcome"`, `"result"`, `"evidence"`, `"externalRef"`, `"observedAt"`} {
+		if !strings.Contains(reconcileJSON, expected) {
+			t.Fatalf("对账 DTO 缺少 camelCase 字段 %s: %s", expected, reconcileJSON)
+		}
+	}
+	if strings.Contains(reconcileJSON, "external_ref") || strings.Contains(reconcileJSON, "observed_at") {
+		t.Fatalf("对账 DTO 不得暴露 snake_case: %s", reconcileJSON)
+	}
 }
 
 func TestListInteractionsNormalizesPendingAndFailsClosedOnTenantLeak(t *testing.T) {
@@ -276,6 +297,10 @@ func TestApproveR3ResolvesInteractionAndAuthorizesEffectAtomically(t *testing.T)
 	if captured.Authorization == nil || captured.Rejection != nil {
 		t.Fatalf("authorization/rejection = %#v / %#v", captured.Authorization, captured.Rejection)
 	}
+	if !captured.ResumeWaitingAttempt || captured.FailWaitingAttempt {
+		t.Fatalf("waiting attempt action = resume:%v fail:%v",
+			captured.ResumeWaitingAttempt, captured.FailWaitingAttempt)
+	}
 	if captured.Authorization.ExpectedStatus != effect.StatusPrepared ||
 		captured.Authorization.NextStatus != effect.StatusAuthorized ||
 		captured.Authorization.ExpectedEffectVersion != linked.Version {
@@ -318,6 +343,10 @@ func TestRejectSealsPreparedEffectWithoutInventingTerminalStatus(t *testing.T) {
 	}
 	if captured.Authorization != nil || captured.Rejection == nil {
 		t.Fatalf("authorization/rejection = %#v / %#v", captured.Authorization, captured.Rejection)
+	}
+	if captured.ResumeWaitingAttempt || !captured.FailWaitingAttempt {
+		t.Fatalf("waiting attempt action = resume:%v fail:%v",
+			captured.ResumeWaitingAttempt, captured.FailWaitingAttempt)
 	}
 	if captured.Rejection.ExpectedStatus != effect.StatusPrepared || captured.Rejection.Reason != "风险窗口已关闭" {
 		t.Fatalf("rejection = %#v", captured.Rejection)
@@ -427,7 +456,23 @@ func TestEffectReconcileCompensateStateMachineAndR3Evidence(t *testing.T) {
 		t.Fatalf("reconcile transition = %#v", captured)
 	}
 
-	current.Status = effect.StatusPrepared
+	current.Status, current.Version = effect.StatusReconciling, 10
+	result, err = service.Reconcile(ctx, testEffect, "reconcile-finish", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusSucceeded,
+		Result:      map[string]any{"confirmed": true},
+		Evidence:    map[string]any{"source": "provider-query", "httpStatus": 200},
+		ExternalRef: "external-42",
+	})
+	if err != nil || result.Status != effect.StatusSucceeded {
+		t.Fatalf("Finish Reconcile() = %#v, %v", result, err)
+	}
+	if !captured.ResumeWaitingAttempt || captured.FailWaitingAttempt ||
+		captured.ExternalRef != "external-42" || captured.Result["confirmed"] != true ||
+		captured.Evidence["source"] != "provider-query" {
+		t.Fatalf("reconcile completion = %#v", captured)
+	}
+
+	current.Status, current.Version = effect.StatusPrepared, 9
 	_, err = service.Reconcile(ctx, testEffect, "reconcile-invalid", EffectCommandRequest{Version: 9})
 	if !errors.Is(err, effect.ErrInvalidTransition) {
 		t.Fatalf("invalid reconcile err = %v", err)
@@ -445,6 +490,126 @@ func TestEffectReconcileCompensateStateMachineAndR3Evidence(t *testing.T) {
 	_, err = service.Compensate(ctx, testEffect, "compensate-r3", EffectCommandRequest{Version: 9})
 	if !errors.Is(err, ErrApprovalRequired) {
 		t.Fatalf("R3 without evidence err = %v", err)
+	}
+}
+
+func TestEffectReconcileRequiresAuditableFinalEvidence(t *testing.T) {
+	current := EffectView{
+		ID: testEffect, TenantID: testTenantA, RunID: testRun, AttemptID: testAttempt,
+		RiskLevel: effect.RiskR2ExternalReversible, Status: effect.StatusReconciling,
+		Version: 10,
+	}
+	var captured TransitionEffectRecord
+	store := &fakeStore{
+		getEffectFn: func(context.Context, uuid.UUID, uuid.UUID) (*EffectView, error) {
+			copy := current
+			return &copy, nil
+		},
+		transitionEffectFn: func(_ context.Context, record TransitionEffectRecord) (*EffectView, error) {
+			captured = record
+			copy := current
+			copy.Status = record.NextStatus
+			copy.Version++
+			return &copy, nil
+		},
+	}
+	service := NewService(store)
+	ctx := testContext(testTenantA, "operator", ScopeEffectReconcile)
+
+	_, err := service.Reconcile(ctx, testEffect, "missing-evidence", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusSucceeded, ExternalRef: "external-42",
+	})
+	if !errors.Is(err, ErrInvalidRequest) || !strings.Contains(err.Error(), "evidence") {
+		t.Fatalf("缺少 evidence err = %v", err)
+	}
+
+	_, err = service.Reconcile(ctx, testEffect, "oversized-evidence", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusFailed, ExternalRef: "external-42",
+		Evidence: map[string]any{"providerResponse": strings.Repeat("x", maximumPayloadSize)},
+	})
+	if !errors.Is(err, ErrInvalidRequest) || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("过大 evidence err = %v", err)
+	}
+
+	_, err = service.Reconcile(ctx, testEffect, "missing-external-ref", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusSucceeded,
+		Evidence: map[string]any{"source": "provider-query"},
+	})
+	if !errors.Is(err, ErrInvalidRequest) || !strings.Contains(err.Error(), "externalRef") {
+		t.Fatalf("缺少 externalRef err = %v", err)
+	}
+
+	// Adapter 在进入 UNKNOWN 前可能已经持久化了外部资源 ID。人工对账时
+	// 允许不重复提交，但必须明确从账本中读到该引用。
+	current.ExternalRef = "persisted-external-42"
+	result, err := service.Reconcile(ctx, testEffect, "persisted-external-ref", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusSucceeded,
+		Result:   map[string]any{"state": "ready"},
+		Evidence: map[string]any{"source": "provider-query", "statusCode": 200},
+	})
+	if err != nil || result.Status != effect.StatusSucceeded {
+		t.Fatalf("使用已持久化 externalRef 收敛 = %#v, %v", result, err)
+	}
+	if captured.ExternalRef != "" || captured.Evidence["source"] != "provider-query" {
+		t.Fatalf("对账写入合同 = %#v", captured)
+	}
+
+	current.ExternalRef = ""
+	_, err = service.Reconcile(ctx, testEffect, "unknown-without-reason", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusUnknown,
+	})
+	if !errors.Is(err, ErrInvalidRequest) || !strings.Contains(err.Error(), "reason") {
+		t.Fatalf("UNKNOWN 缺少 reason err = %v", err)
+	}
+	unknown, err := service.Reconcile(ctx, testEffect, "unknown-with-reason", EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusUnknown, Reason: "provider query timed out",
+	})
+	if err != nil || unknown.Status != effect.StatusUnknown || captured.Reason != "provider query timed out" {
+		t.Fatalf("UNKNOWN 对账 = %#v, record=%#v, err=%v", unknown, captured, err)
+	}
+}
+
+func TestEffectReconcileIdempotencyHashIncludesEvidence(t *testing.T) {
+	current := EffectView{
+		ID: testEffect, TenantID: testTenantA, RunID: testRun, AttemptID: testAttempt,
+		RiskLevel: effect.RiskR2ExternalReversible, Status: effect.StatusReconciling,
+		ExternalRef: "external-42", Version: 10,
+	}
+	hashes := make([]string, 0, 2)
+	store := &fakeStore{
+		findMutationFn: func(_ context.Context, _ uuid.UUID, _ string, hash string) (*MutationResult, error) {
+			hashes = append(hashes, hash)
+			return nil, nil
+		},
+		getEffectFn: func(context.Context, uuid.UUID, uuid.UUID) (*EffectView, error) {
+			copy := current
+			return &copy, nil
+		},
+		transitionEffectFn: func(_ context.Context, record TransitionEffectRecord) (*EffectView, error) {
+			copy := current
+			copy.Status = record.NextStatus
+			copy.Version++
+			return &copy, nil
+		},
+	}
+	service := NewService(store)
+	ctx := testContext(testTenantA, "operator", ScopeEffectReconcile)
+	base := EffectCommandRequest{
+		Version: 10, Outcome: effect.StatusSucceeded,
+		Result: map[string]any{"state": "ready"},
+	}
+	first := base
+	first.Evidence = map[string]any{"queryId": "query-a", "statusCode": 200}
+	if _, err := service.Reconcile(ctx, testEffect, "evidence-hash-a", first); err != nil {
+		t.Fatal(err)
+	}
+	second := base
+	second.Evidence = map[string]any{"queryId": "query-b", "statusCode": 200}
+	if _, err := service.Reconcile(ctx, testEffect, "evidence-hash-b", second); err != nil {
+		t.Fatal(err)
+	}
+	if len(hashes) != 2 || hashes[0] == hashes[1] {
+		t.Fatalf("证据未进入幂等指纹: %#v", hashes)
 	}
 }
 

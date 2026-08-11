@@ -88,6 +88,11 @@ func New(ctx context.Context, url string) (*Bus, error) {
 		Subjects: []string{
 			"swarm.>", "task.>", "agent.>", "agent_template.>",
 			"attempt.>", "tool.>", "evaluation.>",
+			// V1.5 Run/Plan 与安全执行面都使用同一份事务 Outbox。若 Stream
+			// 没有声明这些主题，WithExpectStream 会明确拒绝发布，事件随后会
+			// 永久停留在指数退避队列中，而不是成为可消费的审计事实。
+			"run.>", "plan.>", "effect.>", "interaction.>",
+			"artifact.>", "verification.>", "failure.>",
 		},
 		Storage:    jetstream.FileStorage,
 		Retention:  jetstream.LimitsPolicy,
@@ -119,5 +124,17 @@ func (b *Bus) Close() error {
 		return fmt.Errorf("drain NATS 连接: %w", err)
 	}
 	b.connection.Close()
+	return nil
+}
+
+// Ping 通过 Flush 往返确认当前 NATS 连接仍可用。仅检查本地 IsConnected 不足以发现
+// 半开 TCP 连接；FlushWithContext 会等待服务端 PONG，并受 readiness 总超时约束。
+func (b *Bus) Ping(ctx context.Context) error {
+	if b == nil || b.connection == nil {
+		return fmt.Errorf("NATS Bus 未初始化")
+	}
+	if err := b.connection.FlushWithContext(ctx); err != nil {
+		return fmt.Errorf("NATS Flush: %w", err)
+	}
 	return nil
 }

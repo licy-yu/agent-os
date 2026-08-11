@@ -176,13 +176,23 @@ func invalidateCandidateArtifact(ctx context.Context, tx pgx.Tx, closure verific
 	return err
 }
 
-// finalizeRunIfComplete 在已持有 swarm 行锁时检查所有 Task。最后一个成功 Task 会生成
-// Run 级最终证据 Artifact 和 CompletionManifest，再原子地把 Run 标记为 COMPLETED。
+// finalizeRunIfComplete 在已持有 swarm 行锁时只检查当前 PlanVersion 的 Task。Replan 会
+// 永久保留被替代计划中的 CANCELED/FAILED Task；若把整条 Run 历史都计入 remaining，新的
+// 活跃计划即使全部成功也永远不能完成。旧 V1 Run 没有 current_plan_version_id，此时保留
+// “统计全部 Task”的兼容语义。最终 Artifact/Manifest 同样只聚合当前计划的有效证据。
 func finalizeRunIfComplete(ctx context.Context, tx pgx.Tx, tenantID, runID, taskID, attemptID uuid.UUID,
 	createdBy string, now time.Time,
 ) (bool, error) {
 	var remaining int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE swarm_id=$1 AND status<>'SUCCEEDED'`, runID).
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM tasks t
+		JOIN swarms run_scope
+		  ON run_scope.id=t.swarm_id AND run_scope.tenant_id=t.tenant_id
+		WHERE t.tenant_id=$1 AND t.swarm_id=$2
+		  AND (run_scope.current_plan_version_id IS NULL
+		       OR t.plan_version_id=run_scope.current_plan_version_id)
+		  AND t.status<>'SUCCEEDED'`, tenantID, runID).
 		Scan(&remaining); err != nil {
 		return false, fmt.Errorf("检查 Run Task 完成度: %w", err)
 	}
@@ -196,9 +206,17 @@ func finalizeRunIfComplete(ctx context.Context, tx pgx.Tx, tenantID, runID, task
 	}
 	artifacts := make([]artifactEvidence, 0)
 	rows, err := tx.Query(ctx, `
-		SELECT id,content_hash,artifact_type FROM artifacts
-		WHERE tenant_id=$1 AND run_id=$2 AND status='VALID' AND artifact_type<>'RUN_COMPLETION'
-		ORDER BY id`, tenantID, runID)
+		SELECT a.id,a.content_hash,a.artifact_type
+		FROM artifacts a
+		JOIN tasks t
+		  ON t.id=a.task_id AND t.tenant_id=a.tenant_id AND t.swarm_id=a.run_id
+		JOIN swarms run_scope
+		  ON run_scope.id=t.swarm_id AND run_scope.tenant_id=t.tenant_id
+		WHERE a.tenant_id=$1 AND a.run_id=$2 AND a.status='VALID'
+		  AND a.artifact_type<>'RUN_COMPLETION'
+		  AND (run_scope.current_plan_version_id IS NULL
+		       OR t.plan_version_id=run_scope.current_plan_version_id)
+		ORDER BY a.id`, tenantID, runID)
 	if err != nil {
 		return false, err
 	}
@@ -218,8 +236,16 @@ func finalizeRunIfComplete(ctx context.Context, tx pgx.Tx, tenantID, runID, task
 
 	manifestIDs := make([]uuid.UUID, 0)
 	rows, err = tx.Query(ctx, `
-		SELECT id FROM completion_manifests
-		WHERE tenant_id=$1 AND run_id=$2 AND task_id IS NOT NULL AND status='VALID' ORDER BY id`, tenantID, runID)
+		SELECT m.id
+		FROM completion_manifests m
+		JOIN tasks t
+		  ON t.id=m.task_id AND t.tenant_id=m.tenant_id AND t.swarm_id=m.run_id
+		JOIN swarms run_scope
+		  ON run_scope.id=t.swarm_id AND run_scope.tenant_id=t.tenant_id
+		WHERE m.tenant_id=$1 AND m.run_id=$2 AND m.status='VALID'
+		  AND (run_scope.current_plan_version_id IS NULL
+		       OR t.plan_version_id=run_scope.current_plan_version_id)
+		ORDER BY m.id`, tenantID, runID)
 	if err != nil {
 		return false, err
 	}
@@ -241,7 +267,14 @@ func finalizeRunIfComplete(ctx context.Context, tx pgx.Tx, tenantID, runID, task
 	rows, err = tx.Query(ctx, `
 		SELECT gr.id FROM gate_results gr
 		JOIN verification_runs vr ON vr.id=gr.verification_run_id
-		WHERE vr.tenant_id=$1 AND vr.run_id=$2 ORDER BY gr.id`, tenantID, runID)
+		JOIN tasks t
+		  ON t.id=vr.task_id AND t.tenant_id=vr.tenant_id AND t.swarm_id=vr.run_id
+		JOIN swarms run_scope
+		  ON run_scope.id=t.swarm_id AND run_scope.tenant_id=t.tenant_id
+		WHERE vr.tenant_id=$1 AND vr.run_id=$2
+		  AND (run_scope.current_plan_version_id IS NULL
+		       OR t.plan_version_id=run_scope.current_plan_version_id)
+		ORDER BY gr.id`, tenantID, runID)
 	if err != nil {
 		return false, err
 	}
@@ -329,7 +362,7 @@ func finalizeRunIfComplete(ctx context.Context, tx pgx.Tx, tenantID, runID, task
 	var runVersion int64
 	if err := tx.QueryRow(ctx, `
 		UPDATE swarms SET status='COMPLETED',completion_manifest_id=$2,version=version+1,updated_at=$3
-		WHERE id=$1 AND status NOT IN ('COMPLETED','FAILED','CANCELED','EXPIRED') RETURNING version`,
+		WHERE id=$1 AND status NOT IN ('SUCCEEDED','COMPLETED','FAILED','CANCELED','EXPIRED') RETURNING version`,
 		runID, runManifestID, now).Scan(&runVersion); err != nil {
 		return false, fmt.Errorf("完成 Run: %w", err)
 	}

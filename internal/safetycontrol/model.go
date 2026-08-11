@@ -157,6 +157,14 @@ type EffectQuery struct {
 type EffectCommandRequest struct {
 	Version int64  `json:"version"`
 	Reason  string `json:"reason,omitempty"`
+	// Outcome 仅用于已进入 RECONCILING 的 Effect。运维人员或外部 Reconciler
+	// 必须查询真实外部系统后，显式提交 SUCCEEDED/FAILED/UNKNOWN 结论。
+	// Result 是外部业务结果；Evidence 是支撑该结论的结构化证据，例如查询
+	// 时间、返回码、资源摘要与证据哈希。两者会一起进入幂等指纹，不得放入密钥。
+	Outcome     effect.Status  `json:"outcome,omitempty"`
+	Result      map[string]any `json:"result,omitempty"`
+	Evidence    map[string]any `json:"evidence,omitempty"`
+	ExternalRef string         `json:"externalRef,omitempty"`
 }
 
 // EffectView 是外部副作用的完整安全读模型。AuthorizationBlocked 表示审批已拒绝但领域状态仍按
@@ -376,17 +384,26 @@ type ResolveInteractionRecord struct {
 	Response        InteractionResponseView
 	Authorization   *EffectAuthorization
 	Rejection       *EffectRejection
-	Mutation        MutationMetadata
+	// ResumeWaitingAttempt/FailWaitingAttempt 把审批结论与暂停的执行生命周期放在
+	// 同一事务：批准后重新发布原 Task，拒绝后终止原 Attempt/Task/Run。
+	ResumeWaitingAttempt bool
+	FailWaitingAttempt   bool
+	Mutation             MutationMetadata
 }
 
 // TransitionEffectRecord 是 reconcile/compensate 的领域校验结果。
 type TransitionEffectRecord struct {
-	EffectID        uuid.UUID
-	ExpectedStatus  effect.Status
-	NextStatus      effect.Status
-	ExpectedVersion int64
-	Reason          string
-	Mutation        MutationMetadata
+	EffectID             uuid.UUID
+	ExpectedStatus       effect.Status
+	NextStatus           effect.Status
+	ExpectedVersion      int64
+	Reason               string
+	Result               map[string]any
+	Evidence             map[string]any
+	ExternalRef          string
+	ResumeWaitingAttempt bool
+	FailWaitingAttempt   bool
+	Mutation             MutationMetadata
 }
 
 // Store 是安全控制面的持久化端口。所有方法都显式携带 tenantId；实现不得先按全局 ID 查询再在内存中过滤。
