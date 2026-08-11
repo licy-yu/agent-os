@@ -124,6 +124,8 @@ Task 继续采用 Controller / Scheduler / Worker / Reviewer 分权：
 | Reviewer / Verification | 只根据持久化证据接受、重试或失败 |
 | RecoveryController | 回收心跳超时 Attempt，并让 Task 进入重试或失败 |
 
+V1.5.4 延续 Scheduler 无候选零写入与 Bind/Reserve 补偿，并增加崩溃遗留 SCHEDULING 的 Controller 回收。回收阈值取 `max(2 × Lease TTL, 1 分钟)`，必须等 Redis Lease 足够可能过期后才处理；SQL 先按 `updated_at` 截止时间筛选，恢复写入再以 `status + version` CAS，多副本同时扫描时只有一个实例能把同一 Task 恢复为 READY 并写出 1 条 `task.ready`，其余实例观察 CAS 失败后退出，不重复发事件。正常空转 Run `927451fd-8590-4ae1-a8ae-a439d6bc9996` 的 Task 在 10 秒内保持 `version=1`、Outbox `=1`、Explain `=1`、`xmin=649540`，后续 COMPLETED。崩溃注入 Run `b935dd37-2594-4148-b20c-9ccd5014c27d` 的 Task `b11fd38f-88c4-4fa2-9e26-fb97b68ebefd` 从人工 SCHEDULING/version 2 恢复为 READY/version 3，`task.ready` 恰好 1 条，后续也完成。阈值边界、多副本 CAS 与故障链已有精确测试；生产合同可用 `scripts/scheduler-churn-smoke.sh` 验证正常空转路径。
+
 Run 动作的客户端合同当前不接收 `expectedVersion`；服务端先读当前版本再 CAS。因此它具备并发冲突保护，但不能夸大为完整的客户端幂等命令协议。Interaction 与 Effect 写命令则明确要求 `version` 和 `Idempotency-Key`。
 
 ## 5. 计划、上下文、产物与验证
@@ -211,16 +213,18 @@ R3 Effect 能自动创建审批 Interaction，并在批准后由重投的普通 
 
 生产候选至少包含 PostgreSQL、Redis、NATS、control-plane、普通 worker；TEMPORAL 模式还必须有独立 Temporal PostgreSQL、Temporal Server、namespace 初始化和 workflow-worker。MinIO/S3、向量库、OTel Collector、TLS 反向代理当前不由主 compose 完整交付。
 
-当前工作树已经提供三个二进制的镜像白名单、workflow-worker systemd unit、强制 production 的 compose、带鉴权且兼容空库的 smoke，以及 `/readyz` 聚合探针。发布时仍必须复核：
+当前工作树已经提供三个二进制的镜像白名单、workflow-worker systemd unit、强制 production 的 compose、带鉴权且兼容空库的 smoke，以及 `/readyz` 聚合探针。2026-08-11 已在目标 Ubuntu VM `192.168.110.128` 的 `/srv/projects/agent-os` 完成一次 production Compose 基础部署；该拓扑同时运行 control-plane、普通 worker、workflow-worker、Temporal Server 和 Temporal 专用 PostgreSQL。产物身份、备份、迁移、容器和端点的逐项结果见 [目标 VM 部署报告](v1.5-deployment-report.md)。
 
-1. 三个 Linux 二进制与 `web/dist` 是当前 commit 的产物，镜像构建真实成功；
-2. systemd unit 中固定的 `User=hale` 与 `/srv/projects/agent-os` 符合目标机；安装脚本依据 `SWARMOS_TEMPORAL_ENABLED` 启用或停用 workflow-worker；
-3. `SWARMOS_ENVIRONMENT=production` 生效，并使用至少 32 字符随机 API Key；
-4. smoke 与 readiness 在空库、有 Run、依赖故障三种情况下行为符合预期；
-5. 普通 worker 与 workflow-worker 有存活、消费积压和失败告警；
-6. 8080 经 TLS/身份边界暴露，9090、9465、7233 与数据库端口留在可信网络。
+基础部署完成后，发布门应按“已验证”与“仍待验证”拆开理解：
 
-这些门槛只有在最终工作树和目标 VM 上验证后才能标记为完成。
+1. 三个 Linux 二进制、`web/dist` 和镜像已能在目标 VM 构建/装载并由 Compose 启动；最终生产应用镜像为 `swarmos-app:v1.5.4`，发布提交为 `6fd6043`，已推送公开 GitHub 分支，准确产物 SHA256 以部署报告为准；
+2. 目标 VM 当前使用 Compose，不应把仓库中 systemd unit 的存在写成 systemd 已上线；切换 systemd 前仍要复核固定的 `User=hale`、绝对目录和 workflow-worker 启停条件；
+3. production 环境和强 API Key 已由服务器 `.env` 注入，仓库只记录“已配置”和长度检查，不记录密钥值；
+4. VM 内部 health/ready、production smoke、Temporal Workflow/Activity Poller 和真实 Temporal Run 已有目标机记录；正常空转 Run `927451fd-8590-4ae1-a8ae-a439d6bc9996` 的 Manifest `c3e3ffe0-51ba-5a6d-b041-ec09164d4083` HTTP 200，崩溃恢复 Run `b935dd37-2594-4148-b20c-9ccd5014c27d` 的 Manifest `84adba6c-7127-5ee8-bf96-1bb11772bffe` HTTP 200。这些记录证明本次目标路径能够工作，但不能外推成 15 项故障注入、长期积压和告警均已通过；
+5. Case 15 仍保持“部分”：当前没有 Run→Manifest 快捷 API，独立 cost ledger 尚未闭环，也没有同一 Run 五类完成证据的完整故障演练与交叉核对报告；
+6. 8080 预定只用于可信 LAN 试用；Windows 宿主机直连仍待 UFW 放行后验收。UFW 的 `192.168.110.0/24` 白名单需用户以 sudo 权限执行，TLS 反向代理、告警和公网身份边界尚未作为本次部署的通过项；9090、9465、7233 与数据库端口必须继续留在可信网络。
+
+因此，“目标 VM 基础部署完成”只关闭了发布产物落机和基础启动验证，不改变 15 项验收矩阵的结论。只有报告中明确通过的检查才可以标成完成，失败、未执行和正在修复的项目都必须保留原状态。
 
 ## 10. 完成定义
 

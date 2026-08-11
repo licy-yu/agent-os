@@ -15,6 +15,8 @@ SwarmOS 把一次用户目标建模为可审计的 `Run -> PlanVersion -> Task -
 
 旧 `/api/v1/swarms`、AgentTemplate、Agent、Task API 保留；新能力以 `/api/v1/runs` 为入口。详细边界见 [V1.5 架构](docs/architecture.md) 与 [15 项验收矩阵](docs/v1.5-acceptance.md)。
 
+2026-08-11 已在 Ubuntu 虚拟机上用 production Compose 完成 V1.5 基础部署，并发布 V1.5.4：生产应用镜像为 `swarmos-app:v1.5.4`，源码提交为 `6fd6043`，已推送到[公开 GitHub 分支](https://github.com/licy-yu/agent-os/tree/codex/swarmos-v15-production)。正常空转 Run `927451fd-8590-4ae1-a8ae-a439d6bc9996` 的 Task 在 10 秒内保持 `version=1`、Outbox `=1`、Explain `=1`、`xmin=649540`，随后 COMPLETED，Manifest `c3e3ffe0-51ba-5a6d-b041-ec09164d4083` HTTP 200；API Key 使用的 `0600` Header 临时文件执行前后数量均为 0。崩溃注入 Run `b935dd37-2594-4148-b20c-9ccd5014c27d` 的 Task `b11fd38f-88c4-4fa2-9e26-fb97b68ebefd` 被人工置为 SCHEDULING/version 2，Controller 恢复为 READY/version 3 且只产生 1 条 `task.ready`，随后 COMPLETED，Manifest `84adba6c-7127-5ee8-bf96-1bb11772bffe` HTTP 200。V1.5.4 采用 `max(2 × Lease TTL, 1 分钟)` 的过期阈值，并以数据库 CAS 保证多副本只有一个恢复者。这些证据不代表设计文档中的 15 项故障注入用例已经全部通过。UFW 放行后使用的局域网入口为 `http://192.168.110.128:8080/`，Windows 宿主机直连仍待用户执行 LAN 白名单后复测；完整证据、剩余边界和回滚信息见 [V1.5 目标 VM 部署报告](docs/v1.5-deployment-report.md)。
+
 ## 技术基线
 
 - Go 1.24、Kratos v2.9.2；
@@ -72,7 +74,15 @@ export SWARMOS_API_KEY='<至少 32 字符的随机值>'
 HTTP 默认监听 `0.0.0.0:8080`，因此在防火墙允许且虚拟机网络可达时，可从宿主机访问：
 
 ```text
-http://<虚拟机 IP>:8080/
+http://192.168.110.128:8080/
+```
+
+当前 VM 内部服务已就绪，但 Windows 宿主机直连尚未验收；需要先按 [使用手册的 UFW LAN 规则](docs/v1.5-usage.md#9-使用虚拟机-ip-访问) 放行，再从 Windows 重新验证页面、`/healthz` 与 `/readyz`。
+
+页面打开后，点击右上角 `API KEY`，录入服务器 `.env` 中的同名配置。仓库和文档不会保存该值；需要时应登录服务器，在受控终端读取：
+
+```bash
+sed -n 's/^SWARMOS_API_KEY=//p' /srv/projects/agent-os/.env
 ```
 
 当前仓库未内置 TLS 或反向代理。不要把 8080、无 API 鉴权的 9090 gRPC、9465 指标端口直接暴露到公网；优先使用仅主机网络、VPN、SSH 隧道或带 TLS/身份认证的反向代理。
@@ -110,4 +120,4 @@ compose.production.yaml 生产候选编排与 Temporal 组件
 
 不要提交 `.env`、数据库密码、API Token、服务器凭据或 `CREDENTIALS.local.md`。Agent 无权绕过 Tool Gateway 直接制造外部副作用；R3 操作必须有 Approval，Effect 进入 `UNKNOWN` 后只能先 Reconcile。认证类 Interaction 只能提交 `credentialRef`，不能把明文密钥放入 `resolution`。
 
-仓库已提供包含 Temporal 的生产候选 compose、三个 systemd unit、带 API Key/空库兼容的 smoke，以及检查 PostgreSQL、Redis、NATS、可选 Temporal 的 `/readyz`。这些仍只是部署代码，不是目标 VM 的通过记录；发布前必须逐项执行 [V1.5 验收矩阵](docs/v1.5-acceptance.md)，并确认普通 worker 与 workflow-worker 实际在消费，不能只以 `/healthz` 或 `/readyz` 成功作为上线依据。
+仓库已提供包含 Temporal 的生产候选 compose、三个 systemd unit、带 API Key/空库兼容的 smoke、Scheduler 空转验收脚本，以及检查 PostgreSQL、Redis、NATS、可选 Temporal 的 `/readyz`。目标 VM 已完成基础部署并归档 [部署报告](docs/v1.5-deployment-report.md)；V1.5.4（`6fd6043`）包含 Manifest 读模型、Scheduler 零写入、Bind/Reserve 冲突补偿与崩溃遗留 SCHEDULING 回收。15 项真实故障场景仍没有全部通过，Case 15 也仍因缺少 Run→Manifest 快捷 API、独立 cost ledger 和五类完整证据演练而保持“部分”。发布判断必须继续以 [V1.5 验收矩阵](docs/v1.5-acceptance.md) 为准，并确认普通 worker 与 workflow-worker 实际在消费，不能只以页面、`/healthz` 或 `/readyz` 成功作为生产通过依据。
