@@ -14,12 +14,14 @@ import (
 	"github.com/licy-yu/agent-os/internal/conf"
 	consoleview "github.com/licy-yu/agent-os/internal/console"
 	"github.com/licy-yu/agent-os/internal/data/postgres"
+	"github.com/licy-yu/agent-os/internal/durabletemporal"
 	"github.com/licy-yu/agent-os/internal/event"
 	"github.com/licy-yu/agent-os/internal/infrastructure/natsevent"
 	"github.com/licy-yu/agent-os/internal/infrastructure/redislease"
 	"github.com/licy-yu/agent-os/internal/observability"
 	"github.com/licy-yu/agent-os/internal/orchestrator"
 	"github.com/licy-yu/agent-os/internal/runcontrol"
+	"github.com/licy-yu/agent-os/internal/safetycontrol"
 	"github.com/licy-yu/agent-os/internal/server"
 	"github.com/licy-yu/agent-os/internal/service"
 )
@@ -80,8 +82,20 @@ func main() {
 
 	svc := service.NewControlPlaneService(repository, repository, repository, repository)
 	runSvc := runcontrol.NewService(repository, false)
+	var temporalGateway *durabletemporal.Gateway
+	if cfg.Temporal.Enabled {
+		// 只有连接和 gRPC 健康检查都成功后才允许创建 TEMPORAL Run。Workflow Worker
+		// 使用同一个 TaskQueue；其不可用会由 Temporal backlog/监控直接暴露。
+		temporalGateway, err = durabletemporal.Dial(initCtx, cfg.Temporal)
+		if err != nil {
+			log.NewHelper(logger).Fatalf("初始化 Temporal Durable Runtime 失败: %v", err)
+		}
+		defer temporalGateway.Close()
+		runSvc.WithDurableRuntime(temporalGateway)
+	}
 	consoleSvc := consoleview.NewService(repository)
-	httpServer := server.NewHTTPServer(cfg.Server, svc, runSvc, consoleSvc, telemetry, logger)
+	safetySvc := safetycontrol.NewService(repository)
+	httpServer := server.NewHTTPServer(cfg.Server, cfg.Security, svc, runSvc, safetySvc, consoleSvc, telemetry, logger)
 	grpcServer := server.NewGRPCServer(cfg.Server, svc, telemetry, logger)
 	taskController := orchestrator.NewTaskController(repository, logger)
 	agentController := orchestrator.NewAgentController(repository)
