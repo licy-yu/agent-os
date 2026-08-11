@@ -29,6 +29,29 @@ type Candidate struct {
 	FinalScore      float64
 }
 
+// CandidateDecision 是 Scheduler Explain 的单候选证据。Reasons 保存硬条件拒绝原因；
+// Accepted=true 的候选才有最终 Score 并进入 Reserve/Bind。
+type CandidateDecision struct {
+	AgentID    uuid.UUID `json:"agentId"`
+	TemplateID uuid.UUID `json:"templateId"`
+	Accepted   bool      `json:"accepted"`
+	Score      float64   `json:"score"`
+	Reasons    []string  `json:"reasons"`
+}
+
+// SchedulerDecision 固化一次 Filter/Score/Reserve 选择，控制台可据此解释为什么选择某个
+// Agent，或为什么任务仍留在 READY。
+type SchedulerDecision struct {
+	SchedulerID     string              `json:"schedulerId"`
+	TaskID          uuid.UUID           `json:"taskId"`
+	TaskVersion     int64               `json:"taskVersion"`
+	QueueScore      float64             `json:"queueScore"`
+	SelectedAgentID *uuid.UUID          `json:"selectedAgentId,omitempty"`
+	SelectedScore   *float64            `json:"selectedScore,omitempty"`
+	Candidates      []CandidateDecision `json:"candidates"`
+	Reason          string              `json:"reason"`
+}
+
 // Store 聚合 Controller/Scheduler 所需的原子数据库操作。
 type Store interface {
 	ListReconcileTasks(context.Context, int) ([]*task.Task, error)
@@ -39,6 +62,7 @@ type Store interface {
 	ListQueuedTasks(context.Context, int) ([]QueuedTask, error)
 	ListSchedulerCandidates(context.Context, uuid.UUID, int64) ([]Candidate, error)
 	BindTask(context.Context, uuid.UUID, int64, uuid.UUID, int64) error
+	RecordSchedulerDecision(context.Context, SchedulerDecision) error
 }
 
 // Clock 使队列等待时间、deadline 和重试条件可以确定性测试。

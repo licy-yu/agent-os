@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 )
 
@@ -19,8 +21,27 @@ type Config struct {
 	Server        ServerConfig        `yaml:"server"`
 	Data          DataConfig          `yaml:"data"`
 	Runtime       RuntimeConfig       `yaml:"runtime"`
+	Temporal      TemporalConfig      `yaml:"temporal"`
+	Security      SecurityConfig      `yaml:"security"`
 	Worker        WorkerConfig        `yaml:"worker"`
 	Observability ObservabilityConfig `yaml:"observability"`
+}
+
+// SecurityConfig 定义 HTTP API 的可信租户边界。APIKey 只允许环境变量注入，yaml 标签
+// 明确忽略它，防止生产密钥误提交到仓库。
+type SecurityConfig struct {
+	APIKey   string `yaml:"-"`
+	TenantID string `yaml:"tenant_id"`
+	Subject  string `yaml:"subject"`
+}
+
+// TemporalConfig 控制 Durable Run Runtime。Enabled=false 时仅允许 LEGACY Run，避免在
+// Temporal Server/Workflow Worker 未就绪时产生“看似运行、实际无人消费”的记录。
+type TemporalConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	Address   string `yaml:"address"`
+	Namespace string `yaml:"namespace"`
+	TaskQueue string `yaml:"task_queue"`
 }
 
 // WorkerConfig 控制独立执行进程的 Durable Consumer、并发和双层心跳。
@@ -72,7 +93,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	// 新增配置项提供保守默认值，旧版部署文件升级二进制时无需一次性补齐非敏感字段。
-	cfg := Config{Worker: WorkerConfig{
+	cfg := Config{Security: SecurityConfig{
+		TenantID: "00000000-0000-0000-0000-000000000001", Subject: "api-operator",
+	}, Temporal: TemporalConfig{
+		Address: "127.0.0.1:7233", Namespace: "default", TaskQueue: "swarmos-runs-v1-5",
+	}, Worker: WorkerConfig{
 		Durable: "swarmos-workers", Concurrency: 4,
 		HeartbeatInterval: 10 * time.Second, AckWait: 30 * time.Second,
 		MetricsAddr: "127.0.0.1:9465",
@@ -82,6 +107,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyEnvironment(&cfg)
+	temporalEnabled, err := BoolFromEnv("SWARMOS_TEMPORAL_ENABLED", cfg.Temporal.Enabled)
+	if err != nil {
+		return nil, fmt.Errorf("配置校验失败: %w", err)
+	}
+	cfg.Temporal.Enabled = temporalEnabled
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("配置校验失败: %w", err)
 	}
@@ -106,6 +136,12 @@ func applyEnvironment(cfg *Config) {
 	overrideDuration("SWARMOS_LEASE_TTL", &cfg.Runtime.LeaseTTL)
 	overrideDuration("SWARMOS_RECONCILE_INTERVAL", &cfg.Runtime.ReconcileInterval)
 	overrideDuration("SWARMOS_OUTBOX_INTERVAL", &cfg.Runtime.OutboxInterval)
+	overrideString("SWARMOS_TEMPORAL_ADDRESS", &cfg.Temporal.Address)
+	overrideString("SWARMOS_TEMPORAL_NAMESPACE", &cfg.Temporal.Namespace)
+	overrideString("SWARMOS_TEMPORAL_TASK_QUEUE", &cfg.Temporal.TaskQueue)
+	overrideString("SWARMOS_API_KEY", &cfg.Security.APIKey)
+	overrideString("SWARMOS_TENANT_ID", &cfg.Security.TenantID)
+	overrideString("SWARMOS_API_SUBJECT", &cfg.Security.Subject)
 
 	overrideString("SWARMOS_WORKER_DURABLE", &cfg.Worker.Durable)
 	overrideInt("SWARMOS_WORKER_CONCURRENCY", &cfg.Worker.Concurrency)
@@ -182,6 +218,18 @@ func (c Config) Validate() error {
 		return errors.New("runtime.reconcile_interval 必须是正时长")
 	case c.Runtime.OutboxInterval <= 0:
 		return errors.New("runtime.outbox_interval 必须是正时长")
+	case c.Temporal.Enabled && c.Temporal.Address == "":
+		return errors.New("temporal.address 在启用时不能为空")
+	case c.Temporal.Enabled && c.Temporal.Namespace == "":
+		return errors.New("temporal.namespace 在启用时不能为空")
+	case c.Temporal.Enabled && c.Temporal.TaskQueue == "":
+		return errors.New("temporal.task_queue 在启用时不能为空")
+	case strings.EqualFold(strings.TrimSpace(c.Server.Environment), "production") && len(c.Security.APIKey) < 32:
+		return errors.New("生产环境 SWARMOS_API_KEY 至少需要 32 个字符")
+	case c.Security.TenantID == "":
+		return errors.New("security.tenant_id 不能为空")
+	case c.Security.Subject == "":
+		return errors.New("security.subject 不能为空")
 	case c.Worker.Durable == "":
 		return errors.New("worker.durable 不能为空")
 	case c.Worker.Concurrency <= 0:
@@ -194,6 +242,9 @@ func (c Config) Validate() error {
 		return errors.New("worker.metrics_addr 不能为空")
 	case c.Observability.TraceSampleRatio < 0 || c.Observability.TraceSampleRatio > 1:
 		return errors.New("observability.trace_sample_ratio 必须在 0~1 之间")
+	}
+	if _, err := uuid.Parse(c.Security.TenantID); err != nil {
+		return fmt.Errorf("security.tenant_id 不是合法 UUID: %w", err)
 	}
 	return nil
 }

@@ -424,11 +424,37 @@ func (r *Repository) ListRuns(ctx context.Context, tenantID uuid.UUID, limit int
 	return items, rows.Err()
 }
 
+// AttachWorkflow 只允许首次绑定，或幂等写入完全相同的 Workflow 身份。同一个业务 Run
+// 若出现不同 WorkflowID/RunID，说明发生了双启动风险，必须返回冲突而不是覆盖证据。
+func (r *Repository) AttachWorkflow(ctx context.Context, tenantID, runID uuid.UUID, ref runcontrol.WorkflowRef) error {
+	if strings.TrimSpace(ref.WorkflowID) == "" || strings.TrimSpace(ref.RunID) == "" {
+		return fmt.Errorf("%w: Temporal Workflow 身份不能为空", runcontrol.ErrInvalidRequest)
+	}
+	return r.withTx(ctx, func(tx pgx.Tx) error {
+		command, err := tx.Exec(ctx, `
+			UPDATE swarms
+			SET temporal_workflow_id=$3,temporal_run_id=$4,runtime_attached_at=now(),updated_at=now()
+			WHERE id=$1 AND tenant_id=$2 AND execution_engine='TEMPORAL'
+			  AND (temporal_workflow_id IS NULL OR temporal_workflow_id=$3)
+			  AND (temporal_run_id IS NULL OR temporal_run_id=$4)`,
+			runID, tenantID, strings.TrimSpace(ref.WorkflowID), strings.TrimSpace(ref.RunID))
+		if err != nil {
+			return mapWriteError("绑定 Temporal Workflow", err)
+		}
+		if command.RowsAffected() != 1 {
+			return fmt.Errorf("%w: Run 不存在、不是 TEMPORAL 或已绑定其他 Workflow", domain.ErrConflict)
+		}
+		return insertTenantOutbox(ctx, tx, tenantID, "swarm", runID, "run.workflow_attached", 1,
+			map[string]any{"workflow_id": ref.WorkflowID, "temporal_run_id": ref.RunID})
+	})
+}
+
 const runViewSelect = `
 	SELECT s.id,s.tenant_id,s.project_id,s.name,s.goal,s.normalized_goal,s.status,
 	       s.desired_state,s.execution_engine,s.budget_tokens,s.budget_cost_micros,
 	       s.spent_tokens,s.spent_cost_micros,s.max_agents,s.priority,
 	       s.current_plan_version_id,COALESCE(p.version_no,0),
+	       COALESCE(s.temporal_workflow_id,''),COALESCE(s.temporal_run_id,''),
 	       COALESCE((SELECT jsonb_object_agg(x.status,x.count) FROM (
 	           SELECT status,count(*) FROM tasks WHERE swarm_id=s.id GROUP BY status
 	       ) x),'{}'::jsonb),
@@ -443,6 +469,7 @@ func scanRunView(row rowScanner) (*runcontrol.RunView, error) {
 		&normalized, &value.Status, &value.DesiredState, &value.ExecutionEngine,
 		&value.BudgetTokens, &value.BudgetCostMicros, &value.SpentTokens, &value.SpentCostMicros,
 		&value.MaxAgents, &value.Priority, &value.CurrentPlanVersionID, &value.CurrentPlanVersion,
+		&value.TemporalWorkflowID, &value.TemporalRunID,
 		&taskStatuses, &value.PendingInteractions, &value.Deadline, &value.Version,
 		&value.CreatedAt, &value.UpdatedAt)
 	if err != nil {

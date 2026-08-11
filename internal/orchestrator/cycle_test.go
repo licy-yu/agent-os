@@ -18,6 +18,7 @@ type cycleStore struct {
 	task      *task.Task
 	candidate Candidate
 	bound     bool
+	decisions []SchedulerDecision
 }
 
 func (s *cycleStore) ListReconcileTasks(context.Context, int) ([]*task.Task, error) {
@@ -49,6 +50,10 @@ func (s *cycleStore) BindTask(_ context.Context, _ uuid.UUID, taskVersion int64,
 		return fmt.Errorf("bind snapshot mismatch")
 	}
 	s.bound = true
+	return nil
+}
+func (s *cycleStore) RecordSchedulerDecision(_ context.Context, value SchedulerDecision) error {
+	s.decisions = append(s.decisions, value)
 	return nil
 }
 
@@ -88,5 +93,7 @@ func TestControllerAndSchedulerCycle(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bound)
 	require.True(t, store.bound)
+	require.Len(t, store.decisions, 1)
+	require.Equal(t, store.candidate.Instance.ID, *store.decisions[0].SelectedAgentID)
 	require.Equal(t, task.StatusScheduling, value.Status, "数据库 Bind 会在真实仓储中原子写为 ASSIGNED")
 }

@@ -67,7 +67,10 @@ func main() {
 	if err != nil {
 		log.NewHelper(logger).Fatalf("初始化任务消费者失败: %v", err)
 	}
-	router := worker.NewRouter(worker.NewOpenAIExecutor())
+	router, err := worker.NewRouter(worker.NewOpenAIExecutor())
+	if err != nil {
+		log.NewHelper(logger).Fatalf("初始化 Eino Agent Runtime 失败: %v", err)
+	}
 	adapters := map[string]toolgateway.Adapter{
 		"native:echo": toolgateway.EchoAdapter{},
 		"mcp:*":       toolgateway.NewMCPAdapter(nil),

@@ -36,6 +36,25 @@ func TestFilterCandidatesUsesHardRequirements(t *testing.T) {
 	require.Equal(t, good.Instance.ID, filtered[0].Instance.ID)
 }
 
+func TestExplainCandidatesKeepsPreciseRejectReasons(t *testing.T) {
+	value := &task.Task{Requirements: task.Requirements{
+		Tools: []string{"shell"}, Permissions: []string{"repo:write"},
+	}}
+	bad := Candidate{
+		Instance:      &agent.Instance{ID: uuid.New(), Status: agent.StatusRunning},
+		Template:      &agent.Template{ID: uuid.New(), Enabled: true, Tools: []string{}, Permissions: []string{}},
+		BudgetAllowed: false,
+	}
+	accepted, explain := ExplainCandidates(value, []Candidate{bad})
+	require.Empty(t, accepted)
+	require.Len(t, explain, 1)
+	require.False(t, explain[0].Accepted)
+	require.Contains(t, explain[0].Reasons, "Agent 不是 IDLE")
+	require.Contains(t, explain[0].Reasons, "Run 剩余预算不足")
+	require.Contains(t, explain[0].Reasons, "缺少必需工具")
+	require.Contains(t, explain[0].Reasons, "权限交集不满足 Task Contract")
+}
+
 func TestScorePrefersProjectContext(t *testing.T) {
 	t.Parallel()
 	value := &task.Task{Requirements: task.Requirements{Skills: map[string]float64{"golang": .8}}}

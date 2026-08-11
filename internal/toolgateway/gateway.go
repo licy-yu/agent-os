@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/licy-yu/agent-os/internal/effect"
 	"github.com/licy-yu/agent-os/internal/execution"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -27,6 +28,12 @@ import (
 var (
 	// ErrDenied 表示调用被策略拒绝，属于可审计的业务结果，而非基础设施故障。
 	ErrDenied = errors.New("工具调用被策略拒绝")
+	// ErrApprovalPending 表示 Effect 已安全停在 PREPARED，等待人工审批。Worker 必须保留
+	// Attempt 并从 Checkpoint 重投，不能把它当成普通执行失败提交 Reviewer。
+	ErrApprovalPending = errors.New("Effect 等待人工审批")
+	// ErrEffectReconcileRequired 表示外部调用结果不确定。原 Execute 绝不能直接重试，
+	// 只能由 Reconciler 对账后把 Effect 收敛到 SUCCEEDED/FAILED。
+	ErrEffectReconcileRequired = errors.New("Effect 必须先对账")
 )
 
 // Definition 是工具注册表的运行时视图。
@@ -55,11 +62,56 @@ type CallRecord struct {
 	StartedAt    time.Time
 }
 
+// EffectRequest 是 R2/R3 ToolCall 在触碰外部世界前提交给 Store 的无密钥事实。
+type EffectRequest struct {
+	ToolCallID     uuid.UUID
+	IdempotencyKey string
+	Request        effect.Request
+	RequestHash    string
+	RiskLevel      effect.RiskLevel
+	EffectType     string
+	RequestedAt    time.Time
+}
+
+// EffectDisposition 告诉 Gateway 当前是否拥有调用 Adapter 的持久化授权。
+type EffectDisposition string
+
+const (
+	EffectExecute         EffectDisposition = "EXECUTE"
+	EffectApprovalPending EffectDisposition = "APPROVAL_PENDING"
+	EffectAlreadyDone     EffectDisposition = "ALREADY_DONE"
+	EffectReconcileOnly   EffectDisposition = "RECONCILE_ONLY"
+	EffectDenied          EffectDisposition = "DENIED"
+	EffectTerminalFailure EffectDisposition = "TERMINAL_FAILURE"
+)
+
+type EffectPermit struct {
+	EffectID      uuid.UUID
+	InteractionID *uuid.UUID
+	Disposition   EffectDisposition
+	Status        effect.Status
+	Version       int64
+	Result        map[string]any
+	Reason        string
+}
+
+// EffectCompletion 将 Adapter 返回转换为确定的 SUCCEEDED 或保守的 UNKNOWN。
+type EffectCompletion struct {
+	Status       effect.Status
+	Result       map[string]any
+	ExternalRef  string
+	ErrorMessage string
+	FinishedAt   time.Time
+}
+
 // Store 负责注册表读取、额度的原子预留以及审计记录完成。
 type Store interface {
 	GetToolDefinition(context.Context, string) (*Definition, error)
-	BeginToolCall(context.Context, CallRecord, int32) error
-	FinishToolCall(context.Context, uuid.UUID, string, map[string]any, string) error
+	BeginToolCall(context.Context, execution.AttemptOwner, CallRecord, int32) error
+	FinishToolCall(context.Context, execution.AttemptOwner, uuid.UUID, string, map[string]any, string) error
+	PrepareToolEffect(context.Context, execution.AttemptOwner, EffectRequest) (*EffectPermit, error)
+	BeginToolEffect(context.Context, execution.AttemptOwner, uuid.UUID, string) error
+	FinishToolEffect(context.Context, execution.AttemptOwner, uuid.UUID, EffectCompletion) error
 }
 
 // Adapter 执行已经通过本地策略的调用。MCP 也只是一种 Adapter，不能绕过 Gateway。
@@ -70,8 +122,10 @@ type Adapter interface {
 // Gateway 是单次 Attempt 的能力令牌：模板白名单、权限、风险区和调用上限都被固定。
 type Gateway struct {
 	store       Store
+	owner       execution.AttemptOwner
 	attemptID   uuid.UUID
 	taskID      uuid.UUID
+	runID       uuid.UUID
 	agentID     uuid.UUID
 	allowed     map[string]struct{}
 	permissions map[string]struct{}
@@ -92,7 +146,8 @@ func New(store Store, work *execution.Work, adapters map[string]Adapter) *Gatewa
 		permissions[strings.ToLower(value)] = struct{}{}
 	}
 	return &Gateway{
-		store: store, attemptID: work.Attempt.ID, taskID: work.Task.ID, agentID: work.Agent.ID,
+		store: store, owner: work.Attempt.Owner(), attemptID: work.Attempt.ID,
+		taskID: work.Task.ID, runID: work.Task.SwarmID, agentID: work.Agent.ID,
 		allowed: allowed, permissions: permissions, riskZone: work.Template.RiskZone,
 		maxCalls: work.Task.ExecutionPolicy.MaxToolCalls, adapters: adapters,
 	}
@@ -107,6 +162,7 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 		trace.WithAttributes(
 			attribute.String("swarmos.tool.name", name),
 			attribute.String("swarmos.attempt.id", g.attemptID.String()),
+			attribute.Int64("swarmos.attempt.fencing_token", g.owner.FencingToken),
 		),
 	)
 	defer span.End()
@@ -121,6 +177,9 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 		attribute.String("swarmos.tool.adapter", definition.Adapter),
 		attribute.String("swarmos.tool.risk_level", definition.RiskLevel),
 	)
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
 	record := CallRecord{
 		ID: uuid.New(), AttemptID: g.attemptID, TaskID: g.taskID, AgentID: g.agentID,
 		ToolName: name, Arguments: arguments, Status: "STARTED", RiskLevel: definition.RiskLevel,
@@ -131,7 +190,7 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 		span.SetStatus(codes.Error, denial)
 		record.Status, record.ErrorMessage = "DENIED", denial
 		// 被拒绝的调用也占用调用额度，防止恶意模型通过重复试探制造无限循环。
-		if beginErr := g.store.BeginToolCall(ctx, record, g.maxCalls); beginErr != nil {
+		if beginErr := g.store.BeginToolCall(ctx, g.owner, record, g.maxCalls); beginErr != nil {
 			return nil, beginErr
 		}
 		return nil, fmt.Errorf("%w: %s", ErrDenied, denial)
@@ -144,33 +203,162 @@ func (g *Gateway) Call(ctx context.Context, name string, arguments map[string]an
 	}
 	if !ok {
 		record.Status, record.ErrorMessage = "DENIED", "未安装对应工具适配器"
-		if beginErr := g.store.BeginToolCall(ctx, record, g.maxCalls); beginErr != nil {
+		if beginErr := g.store.BeginToolCall(ctx, g.owner, record, g.maxCalls); beginErr != nil {
 			return nil, beginErr
 		}
 		return nil, fmt.Errorf("%w: 工具 %s 未安装适配器", ErrDenied, name)
 	}
-	if err := g.store.BeginToolCall(ctx, record, g.maxCalls); err != nil {
+
+	risk, externalEffect := effectRiskLevel(definition.RiskLevel)
+	var effectRequest EffectRequest
+	if externalEffect {
+		effectRequest, err = g.buildEffectRequest(definition, arguments, risk, record.StartedAt)
+		if err != nil {
+			record.Status, record.ErrorMessage = "DENIED", err.Error()
+			if beginErr := g.store.BeginToolCall(ctx, g.owner, record, g.maxCalls); beginErr != nil {
+				return nil, beginErr
+			}
+			return nil, err
+		}
+		// 同一 Effect 的至少一次重投必须命中同一 ToolCall 审计行，防止审批轮询消耗额度。
+		record.ID = stableToolCallID(effectRequest.IdempotencyKey, effectRequest.RequestHash)
+		effectRequest.ToolCallID = record.ID
+	}
+	if err := g.store.BeginToolCall(ctx, g.owner, record, g.maxCalls); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
+	}
+	if externalEffect {
+		permit, prepareErr := g.store.PrepareToolEffect(ctx, g.owner, effectRequest)
+		if prepareErr != nil {
+			_ = g.store.FinishToolCall(ctx, g.owner, record.ID, "DENIED", nil, prepareErr.Error())
+			return nil, prepareErr
+		}
+		switch permit.Disposition {
+		case EffectApprovalPending:
+			return nil, fmt.Errorf("%w: effect=%s interaction=%v", ErrApprovalPending,
+				permit.EffectID, permit.InteractionID)
+		case EffectReconcileOnly:
+			return nil, fmt.Errorf("%w: effect=%s status=%s", ErrEffectReconcileRequired,
+				permit.EffectID, permit.Status)
+		case EffectAlreadyDone:
+			if err := g.store.FinishToolCall(ctx, g.owner, record.ID, "SUCCEEDED", permit.Result, ""); err != nil {
+				return nil, err
+			}
+			return permit.Result, nil
+		case EffectDenied:
+			_ = g.store.FinishToolCall(ctx, g.owner, record.ID, "DENIED", nil, permit.Reason)
+			return nil, fmt.Errorf("%w: %s", ErrDenied, permit.Reason)
+		case EffectTerminalFailure:
+			_ = g.store.FinishToolCall(ctx, g.owner, record.ID, "FAILED", nil, permit.Reason)
+			return nil, errors.New(permit.Reason)
+		case EffectExecute:
+			if err := g.store.BeginToolEffect(ctx, g.owner, permit.EffectID, effectRequest.RequestHash); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("%w: 未知 Effect disposition %q", ErrDenied, permit.Disposition)
+		}
+
+		result, callErr := adapter.Call(ctx, definition, arguments)
+		if callErr != nil {
+			// Adapter 已被调用后，普通 error 无法证明外部系统没有落地副作用；按 UNKNOWN
+			// 持久化并停止直接重试，是比误判 FAILED 更安全的默认语义。
+			finishErr := g.store.FinishToolEffect(ctx, g.owner, permit.EffectID, EffectCompletion{
+				Status: effect.StatusUnknown, ErrorMessage: callErr.Error(), FinishedAt: time.Now().UTC(),
+			})
+			_ = g.store.FinishToolCall(ctx, g.owner, record.ID, "FAILED", nil, callErr.Error())
+			if finishErr != nil {
+				return nil, fmt.Errorf("外部结果不确定且 Effect 落库失败: call=%v effect=%w", callErr, finishErr)
+			}
+			return nil, fmt.Errorf("%w: %v", ErrEffectReconcileRequired, callErr)
+		}
+		externalRef, _ := result["external_ref"].(string)
+		if err := g.store.FinishToolEffect(ctx, g.owner, permit.EffectID, EffectCompletion{
+			Status: effect.StatusSucceeded, Result: result, ExternalRef: externalRef,
+			FinishedAt: time.Now().UTC(),
+		}); err != nil {
+			return nil, err
+		}
+		if err := g.store.FinishToolCall(ctx, g.owner, record.ID, "SUCCEEDED", result, ""); err != nil {
+			return nil, err
+		}
+		span.SetStatus(codes.Ok, "effect succeeded")
+		return result, nil
 	}
 	result, callErr := adapter.Call(ctx, definition, arguments)
 	if callErr != nil {
 		span.RecordError(callErr)
 		span.SetStatus(codes.Error, callErr.Error())
-		finishErr := g.store.FinishToolCall(ctx, record.ID, "FAILED", nil, callErr.Error())
+		finishErr := g.store.FinishToolCall(ctx, g.owner, record.ID, "FAILED", nil, callErr.Error())
 		if finishErr != nil {
 			return nil, fmt.Errorf("调用失败且结束审计失败: call=%v audit=%w", callErr, finishErr)
 		}
 		return nil, callErr
 	}
-	if err := g.store.FinishToolCall(ctx, record.ID, "SUCCEEDED", result, ""); err != nil {
+	if err := g.store.FinishToolCall(ctx, g.owner, record.ID, "SUCCEEDED", result, ""); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	span.SetStatus(codes.Ok, "tool call succeeded")
 	return result, nil
+}
+
+func (g *Gateway) buildEffectRequest(definition *Definition, arguments map[string]any,
+	risk effect.RiskLevel, now time.Time,
+) (EffectRequest, error) {
+	operation, _ := definition.Config["operation"].(string)
+	resource, _ := arguments["resource"].(string)
+	credentialRef, _ := arguments["credential_ref"].(string)
+	request := effect.Request{
+		ToolName: definition.Name, Operation: operation, Resource: resource,
+		Arguments: arguments, CredentialRef: credentialRef,
+	}
+	hash, err := request.Hash()
+	if err != nil {
+		return EffectRequest{}, err
+	}
+	key := firstString(arguments, "_swarmos_idempotency_key", "idempotency_key")
+	if key == "" {
+		// 无显式业务键时使用请求哈希形成稳定恢复键。调用方若需要以相同参数执行两次，
+		// 必须显式提供不同 idempotency_key，消除“重试还是新操作”的歧义。
+		key = fmt.Sprintf("run-%s/task-%s/%s/%s", g.runID, g.taskID,
+			strings.ToLower(definition.Name), strings.TrimPrefix(hash, "sha256:")[:24])
+	}
+	effectType, _ := definition.Config["effect_type"].(string)
+	if strings.TrimSpace(effectType) == "" {
+		effectType = definition.Name
+	}
+	return EffectRequest{
+		IdempotencyKey: key, Request: request, RequestHash: hash, RiskLevel: risk,
+		EffectType: effectType, RequestedAt: now,
+	}, nil
+}
+
+func firstString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func stableToolCallID(key, requestHash string) uuid.UUID {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("swarmos/tool-call/"+key+"/"+requestHash))
+}
+
+func effectRiskLevel(value string) (effect.RiskLevel, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "trusted":
+		return effect.RiskR2ExternalReversible, true
+	case "production":
+		return effect.RiskR3ProductionDestructive, true
+	default:
+		return "", false
+	}
 }
 
 func (g *Gateway) denialReason(definition *Definition) string {

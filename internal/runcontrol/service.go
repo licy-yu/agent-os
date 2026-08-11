@@ -51,8 +51,19 @@ type Service struct {
 	store         Store
 	compiler      *planning.PlanCompiler
 	temporalReady bool
+	runtime       DurableRuntime
 	clock         func() time.Time
 	newID         func() uuid.UUID
+}
+
+// WithDurableRuntime 注入已经完成健康检查的 Temporal Gateway。返回同一个 Service 便于
+// 进程装配；传入未就绪实现会保持 LEGACY 默认值。
+func (s *Service) WithDurableRuntime(runtime DurableRuntime) *Service {
+	if s != nil && runtime != nil && runtime.Ready() {
+		s.runtime = runtime
+		s.temporalReady = true
+	}
+	return s
 }
 
 // NewService 创建 Run 用例。temporalReady 只有在 Temporal Client 和 Workflow Worker 都
@@ -131,7 +142,24 @@ func (s *Service) Create(ctx context.Context, request CreateRunRequest) (*RunVie
 		PlanSource: "USER", PlanCandidate: candidate, ExecutablePlan: *executable,
 		CompilerVersion: compilerVersion, CreatedBy: principal.Subject, CreatedAt: now,
 	}
-	return s.store.CreateCompiledRun(ctx, record)
+	view, err := s.store.CreateCompiledRun(ctx, record)
+	if err != nil {
+		return nil, err
+	}
+	if engine != "TEMPORAL" {
+		return view, nil
+	}
+	// Run/Plan/Task 已经在一个 PostgreSQL 事务中建立。Temporal WorkflowID 由 Run UUID
+	// 确定生成，网络超时后的同请求重试会命中原 Workflow，不会启动第二条执行链。
+	ref, err := s.runtime.StartRun(ctx, view)
+	if err != nil {
+		return nil, fmt.Errorf("Run 已创建但 Durable Workflow 启动失败，可按同一 Run ID 对账: %w", err)
+	}
+	if err := s.store.AttachWorkflow(ctx, principal.TenantID, view.ID, ref); err != nil {
+		return nil, fmt.Errorf("Workflow 已启动但身份投影失败，需按 WorkflowID %s 对账: %w", ref.WorkflowID, err)
+	}
+	view.TemporalWorkflowID, view.TemporalRunID = ref.WorkflowID, ref.RunID
+	return view, nil
 }
 
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (*RunView, error) {
@@ -173,8 +201,20 @@ func (s *Service) transition(ctx context.Context, id uuid.UUID, next run.Status,
 	if err := aggregate.Transition(run.ActorController, next); err != nil {
 		return nil, err
 	}
-	return s.store.TransitionRun(ctx, principal.TenantID, id, current.Version, next, desired,
+	view, err := s.store.TransitionRun(ctx, principal.TenantID, id, current.Version, next, desired,
 		strings.TrimSpace(reason))
+	if err != nil {
+		return nil, err
+	}
+	if current.ExecutionEngine == "TEMPORAL" && s.runtime != nil {
+		// PostgreSQL 事务和 Outbox 已先提交；若 Signal 短暂失败，Workflow 的投影轮询会在
+		// 下一周期修复状态，因此这里返回错误但绝不回滚已生效的用户动作。
+		if err := s.runtime.SignalRun(ctx, id, desiredCommand(desired), reason,
+			view.CurrentPlanVersion, nil); err != nil {
+			return nil, fmt.Errorf("Run 状态已更新，Temporal Signal 待对账: %w", err)
+		}
+	}
+	return view, nil
 }
 
 // Replan 生成新 PlanVersion，并只取消旧计划中尚未终结的 Task。成功 Task、Artifact、Effect、
@@ -232,7 +272,29 @@ func (s *Service) Replan(ctx context.Context, id uuid.UUID, request ReplanReques
 		PlanSource: "REPLAN", PlanCandidate: candidate, ExecutablePlan: *executable,
 		CompilerVersion: compilerVersion, CreatedBy: principal.Subject, CreatedAt: s.clock(),
 	}
-	return s.store.ActivateReplan(ctx, principal.TenantID, id, current.Version, record, request.Reason)
+	view, err := s.store.ActivateReplan(ctx, principal.TenantID, id, current.Version, record, request.Reason)
+	if err != nil {
+		return nil, err
+	}
+	if current.ExecutionEngine == "TEMPORAL" && s.runtime != nil {
+		if err := s.runtime.SignalRun(ctx, id, "REPLAN", request.Reason, record.PlanVersion, map[string]any{
+			"goal": goal, "planVersionId": record.PlanVersionID.String(),
+		}); err != nil {
+			return nil, fmt.Errorf("PlanVersion 已激活，Temporal Replan Signal 待对账: %w", err)
+		}
+	}
+	return view, nil
+}
+
+func desiredCommand(desired string) string {
+	switch desired {
+	case "PAUSED":
+		return "PAUSE"
+	case "CANCELED":
+		return "CANCEL"
+	default:
+		return "RESUME"
+	}
 }
 
 func (s *Service) normalizeEngine(raw string) (string, error) {

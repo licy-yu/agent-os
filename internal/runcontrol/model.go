@@ -50,6 +50,21 @@ type ResolveInteractionRequest struct {
 	Version    int64          `json:"version,omitempty"`
 }
 
+// WorkflowRef 是 Durable Runtime 启动后返回的稳定身份。业务 Run UUID 与 WorkflowID
+// 一一对应，Temporal RunID 则标识具体执行历史。
+type WorkflowRef struct {
+	WorkflowID string `json:"workflowId"`
+	RunID      string `json:"runId"`
+}
+
+// DurableRuntime 隔离 Temporal SDK，Run 用例层只依赖业务动作。实现必须保证 StartRun
+// 对同一个 Run 幂等，SignalRun 的重复投递不会产生额外副作用。
+type DurableRuntime interface {
+	Ready() bool
+	StartRun(context.Context, *RunView) (WorkflowRef, error)
+	SignalRun(context.Context, uuid.UUID, string, string, int32, map[string]any) error
+}
+
 // RunView 是控制台的稳定读模型。Task/Interaction 计数来自数据库聚合，不写回 Run 行。
 type RunView struct {
 	ID                   uuid.UUID        `json:"id"`
@@ -69,6 +84,8 @@ type RunView struct {
 	Priority             int32            `json:"priority"`
 	CurrentPlanVersionID *uuid.UUID       `json:"currentPlanVersionId,omitempty"`
 	CurrentPlanVersion   int32            `json:"currentPlanVersion"`
+	TemporalWorkflowID   string           `json:"temporalWorkflowId,omitempty"`
+	TemporalRunID        string           `json:"temporalRunId,omitempty"`
 	TaskStatuses         map[string]int64 `json:"taskStatuses"`
 	PendingInteractions  int64            `json:"pendingInteractions"`
 	Deadline             *time.Time       `json:"deadline,omitempty"`
@@ -139,4 +156,5 @@ type Store interface {
 	TransitionRun(context.Context, uuid.UUID, uuid.UUID, int64, run.Status, string, string) (*RunView, error)
 	ActivateReplan(context.Context, uuid.UUID, uuid.UUID, int64, CreateRecord, string) (*RunView, error)
 	GetPlan(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (*PlanView, error)
+	AttachWorkflow(context.Context, uuid.UUID, uuid.UUID, WorkflowRef) error
 }

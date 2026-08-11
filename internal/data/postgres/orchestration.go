@@ -180,8 +180,7 @@ func (r *Repository) ListSchedulerCandidates(ctx context.Context, swarmID uuid.U
 		FROM agent_instances ai
 		JOIN agent_templates at ON at.id=ai.template_id
 		JOIN swarms s ON s.id=$1
-		WHERE ai.status='IDLE' AND at.enabled=true
-		  AND (ai.swarm_id IS NULL OR ai.swarm_id=$1)
+		WHERE (ai.swarm_id IS NULL OR ai.swarm_id=$1)
 		ORDER BY ai.load,ai.created_at`, swarmID, taskMaxTokens)
 	if err != nil {
 		return nil, fmt.Errorf("查询 scheduler candidates: %w", err)
@@ -223,6 +222,41 @@ func (r *Repository) ListSchedulerCandidates(ctx context.Context, swarmID uuid.U
 		})
 	}
 	return items, rows.Err()
+}
+
+// RecordSchedulerDecision 保存完整 Filter/Score 证据。task_id 反查 tenant/run，调用方不能
+// 通过请求体伪造租户归属。
+func (r *Repository) RecordSchedulerDecision(ctx context.Context, decision orchestrator.SchedulerDecision) error {
+	candidatesRaw, err := marshalJSON(decision.Candidates, "scheduler.candidates")
+	if err != nil {
+		return err
+	}
+	filters := make([]orchestrator.CandidateDecision, 0)
+	for _, candidate := range decision.Candidates {
+		if !candidate.Accepted {
+			filters = append(filters, candidate)
+		}
+	}
+	filtersRaw, err := marshalJSON(filters, "scheduler.filters")
+	if err != nil {
+		return err
+	}
+	command, err := r.pool.Exec(ctx, `
+		INSERT INTO scheduler_decisions(
+			id,tenant_id,run_id,task_id,scheduler_id,task_version,queue_score,
+			selected_agent_id,selected_score,candidates,filters,reason
+		)
+		SELECT $2,t.tenant_id,t.swarm_id,t.id,$3,$4,$5,$6,$7,$8,$9,$10
+		FROM tasks t WHERE t.id=$1`, decision.TaskID, uuid.New(), decision.SchedulerID,
+		decision.TaskVersion, decision.QueueScore, decision.SelectedAgentID, decision.SelectedScore,
+		candidatesRaw, filtersRaw, decision.Reason)
+	if err != nil {
+		return mapWriteError("写入 Scheduler Explain", err)
+	}
+	if command.RowsAffected() != 1 {
+		return fmt.Errorf("%w: scheduler task %s", domain.ErrNotFound, decision.TaskID)
+	}
+	return nil
 }
 
 // BindTask 原子地把 Task 和 Agent 互相绑定；任一 CAS 失败都会整体回滚。

@@ -20,6 +20,18 @@ runtime:
   reconcile_interval: 5s
   outbox_interval: 1s
 
+temporal:
+  # 默认关闭以兼容未部署 Temporal 的旧环境；生产启用后新 Run 默认使用 Durable Runtime。
+  enabled: false
+  address: 127.0.0.1:7233
+  namespace: default
+  task_queue: swarmos-runs-v1-5
+
+security:
+  # API Key 只能通过 SWARMOS_API_KEY 注入；这里仅声明默认租户和审计主体。
+  tenant_id: 00000000-0000-0000-0000-000000000001
+  subject: api-operator
+
 worker:
   # 多个 Worker 使用同一个 Durable 名称，JetStream 会把任务在进程间均衡分配。
   durable: swarmos-workers

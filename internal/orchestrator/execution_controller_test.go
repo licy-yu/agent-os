@@ -20,9 +20,11 @@ type reviewStore struct {
 func (s *reviewStore) ClaimWork(context.Context, uuid.UUID, uuid.UUID, string) (*execution.Work, error) {
 	return nil, nil
 }
-func (s *reviewStore) SaveCheckpoint(context.Context, execution.Checkpoint) error { return nil }
-func (s *reviewStore) HeartbeatAttempt(context.Context, uuid.UUID, string) error  { return nil }
-func (s *reviewStore) CompleteAttempt(context.Context, uuid.UUID, execution.ExecutionResult) error {
+func (s *reviewStore) SaveCheckpoint(context.Context, execution.AttemptOwner, execution.Checkpoint) error {
+	return nil
+}
+func (s *reviewStore) HeartbeatAttempt(context.Context, execution.AttemptOwner) error { return nil }
+func (s *reviewStore) CompleteAttempt(context.Context, execution.AttemptOwner, execution.ExecutionResult) error {
 	return nil
 }
 func (s *reviewStore) ListReviewWork(context.Context, int) ([]*execution.Work, error) {

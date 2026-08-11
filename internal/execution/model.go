@@ -6,6 +6,7 @@ package execution
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,27 +28,66 @@ const (
 
 // Attempt 保存一次执行所需的最小审计信息。Input/Output 是执行当时的不可变快照。
 type Attempt struct {
-	ID               uuid.UUID
-	TaskID           uuid.UUID
-	AgentID          uuid.UUID
-	Number           int32
-	Status           AttemptStatus
-	InputSnapshot    map[string]any
-	OutputSnapshot   map[string]any
-	Model            string
-	PromptVersion    string
-	WorkerID         string
-	StartedAt        time.Time
-	FinishedAt       *time.Time
-	HeartbeatAt      time.Time
-	TokensIn         int64
-	TokensOut        int64
-	CostMicros       int64
-	StepCount        int32
-	ToolCallCount    int32
-	NoProgressRounds int32
-	ErrorCode        string
-	ErrorMessage     string
+	ID             uuid.UUID
+	TaskID         uuid.UUID
+	AgentID        uuid.UUID
+	Number         int32
+	Status         AttemptStatus
+	InputSnapshot  map[string]any
+	OutputSnapshot map[string]any
+	Model          string
+	PromptVersion  string
+	WorkerID       string
+	// FencingToken 是数据库签发的单调所有权凭据。WorkerID 只标识执行者名称，
+	// token 才能阻止已经失去所有权的旧进程继续提交 Step、Tool 或最终结果。
+	FencingToken int64
+	// ResumeCheckpointID 指向前一个 Attempt 的恢复点；它只作为只读输入，
+	// 新 Attempt 仍拥有独立的 ID、worker 和 fence。
+	ResumeCheckpointID *uuid.UUID
+	StartedAt          time.Time
+	FinishedAt         *time.Time
+	HeartbeatAt        time.Time
+	TokensIn           int64
+	TokensOut          int64
+	CostMicros         int64
+	StepCount          int32
+	ToolCallCount      int32
+	NoProgressRounds   int32
+	ErrorCode          string
+	ErrorMessage       string
+}
+
+// AttemptOwner 是每次有状态写操作必须携带的执行所有权证明。
+// AttemptID、WorkerID 和 FencingToken 必须作为整体校验，不能只检查其中一项。
+type AttemptOwner struct {
+	AttemptID    uuid.UUID
+	WorkerID     string
+	FencingToken int64
+}
+
+// Owner 返回当前 Attempt 的不可变所有权快照，供 Worker、CheckpointWriter 和
+// Tool Gateway 贯穿传递同一个 fencing token。
+func (a Attempt) Owner() AttemptOwner {
+	return AttemptOwner{AttemptID: a.ID, WorkerID: a.WorkerID, FencingToken: a.FencingToken}
+}
+
+// OwnedBy 用完整三元组判断一次数据库写入是否仍属于当前 Attempt。
+func (a Attempt) OwnedBy(owner AttemptOwner) bool {
+	return owner.Valid() && a.ID == owner.AttemptID && a.WorkerID == owner.WorkerID &&
+		a.FencingToken == owner.FencingToken
+}
+
+// CanReplay 只允许签发该活跃 Attempt 的同一 Worker 消费重复 assignment 消息。
+// 不同 Worker 即使知道 Attempt ID 也不能热接管；接管必须先终止旧 Attempt 再创建新 Attempt。
+func (a Attempt) CanReplay(workerID string) bool {
+	return a.Status == AttemptRunning && a.FencingToken > 0 &&
+		a.WorkerID == strings.TrimSpace(workerID)
+}
+
+// Valid 在进入数据库前拒绝零值所有权。fence 从 1 开始，0 仅用于迁移旧数据，
+// 不能授权新的执行写操作。
+func (o AttemptOwner) Valid() bool {
+	return o.AttemptID != uuid.Nil && strings.TrimSpace(o.WorkerID) != "" && o.FencingToken > 0
 }
 
 // Work 是 Worker 领取后的完整、版本固定的执行上下文。
@@ -57,6 +97,10 @@ type Work struct {
 	Agent    *agent.Instance
 	Template *agent.Template
 	Attempt  *Attempt
+	// LatestCheckpoint 是 ClaimWork 在同一事务快照中读取的最近恢复点。
+	// 它既可能属于同一 Attempt（至少一次消息重放），也可能属于上一 Attempt（失败恢复）；
+	// 没有任何已持久化恢复边界时才为 nil。
+	LatestCheckpoint *Checkpoint
 }
 
 // Checkpoint 是 Agent Loop 的可恢复边界。State 必须只含可 JSON 序列化的数据。
@@ -67,6 +111,60 @@ type Checkpoint struct {
 	StepName     string
 	State        map[string]any
 	ArtifactRefs []string
+	FencingToken int64
+	CreatedAt    time.Time
+}
+
+// StepType 是 task_steps 表允许的封闭类型集合。
+type StepType string
+
+const (
+	StepPlan       StepType = "PLAN"
+	StepModel      StepType = "MODEL"
+	StepTool       StepType = "TOOL"
+	StepObserve    StepType = "OBSERVE"
+	StepWrite      StepType = "WRITE"
+	StepVerify     StepType = "VERIFY"
+	StepCheckpoint StepType = "CHECKPOINT"
+	StepHandoff    StepType = "HANDOFF"
+	StepHuman      StepType = "HUMAN"
+)
+
+// StepStatus 是单个 typed Step 的执行状态。
+type StepStatus string
+
+const (
+	StepPending   StepStatus = "PENDING"
+	StepRunning   StepStatus = "RUNNING"
+	StepWaiting   StepStatus = "WAITING"
+	StepSucceeded StepStatus = "SUCCEEDED"
+	StepFailed    StepStatus = "FAILED"
+	StepSkipped   StepStatus = "SKIPPED"
+	StepCanceled  StepStatus = "CANCELED"
+)
+
+// TaskStep 是 Attempt 内不可覆盖的最小审计单元。当前阶段在每次 Checkpoint 时创建
+// SUCCEEDED/CHECKPOINT Step；后续 Eino Runtime 可复用同一类型记录 MODEL、TOOL 等步骤。
+type TaskStep struct {
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	RunID        uuid.UUID
+	TaskID       uuid.UUID
+	AttemptID    uuid.UUID
+	Sequence     int32
+	Type         StepType
+	Name         string
+	Status       StepStatus
+	Input        map[string]any
+	Output       map[string]any
+	Usage        map[string]any
+	ModelCallID  string
+	ToolCallID   *uuid.UUID
+	CheckpointID *uuid.UUID
+	ErrorCode    string
+	ErrorMessage string
+	StartedAt    *time.Time
+	FinishedAt   *time.Time
 	CreatedAt    time.Time
 }
 
@@ -108,9 +206,9 @@ type Evaluation struct {
 // ClaimWork 和 ApplyReview 是状态机边界，必须在单个数据库事务内同时写入 Outbox。
 type Store interface {
 	ClaimWork(context.Context, uuid.UUID, uuid.UUID, string) (*Work, error)
-	SaveCheckpoint(context.Context, Checkpoint) error
-	HeartbeatAttempt(context.Context, uuid.UUID, string) error
-	CompleteAttempt(context.Context, uuid.UUID, ExecutionResult) error
+	SaveCheckpoint(context.Context, AttemptOwner, Checkpoint) error
+	HeartbeatAttempt(context.Context, AttemptOwner) error
+	CompleteAttempt(context.Context, AttemptOwner, ExecutionResult) error
 	ListReviewWork(context.Context, int) ([]*Work, error)
 	ApplyReview(context.Context, *Work, Evaluation, time.Time) error
 	RecoverTimedOut(context.Context, time.Time, int) (int, error)

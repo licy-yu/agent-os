@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-kratos/kratos/v2/log"
 	"github.com/google/uuid"
+	"github.com/licy-yu/agent-os/internal/agentloop"
 	"github.com/licy-yu/agent-os/internal/assignment"
+	"github.com/licy-yu/agent-os/internal/contextengine"
 	"github.com/licy-yu/agent-os/internal/execution"
+	"github.com/licy-yu/agent-os/internal/failure"
 	"github.com/licy-yu/agent-os/internal/toolgateway"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -155,25 +159,44 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	heartbeatDone := make(chan struct{})
-	go r.heartbeat(ctx, work.Attempt.ID, message, heartbeatDone)
+	owner := work.Attempt.Owner()
+	go r.heartbeat(ctx, owner, message, heartbeatDone)
 
-	writer := &checkpointWriter{store: r.store, attemptID: work.Attempt.ID, sequence: work.Attempt.StepCount}
+	sequence := checkpointResumeSequence(work)
+	writer := &checkpointWriter{store: r.store, owner: owner, sequence: sequence}
 	gateway := toolgateway.New(r.toolStore, work, r.adapters)
 	result, executeErr := r.router.ForModel(work.Template.Model).Execute(ctx, work, writer, gateway)
+	// cancel 之后 ctx.Err() 必然至少是 context.Canceled；先保存真实执行结果，才能
+	// 区分 DeadlineExceeded 与 Worker 主动结束心跳，避免把超时误分类为普通模型错误。
+	executionContextErr := ctx.Err()
 	cancel()
 	<-heartbeatDone
+	if keepAttemptOpen(executeErr) {
+		// 审批等待与 UNKNOWN 对账都不是普通执行失败。保持 RUNNING Attempt 后 NAK，
+		// 下一次投递会由 ClaimWork 装载 LatestCheckpoint；AUTHORIZED 后才继续外部调用。
+		return executeErr
+	}
 	if executeErr != nil {
 		span.RecordError(executeErr)
 		span.SetStatus(codes.Error, executeErr.Error())
 		// 模型/工具错误也形成 Reviewer 可见证据，避免只能等待心跳超时才能重试。
-		result.Output = map[string]any{"execution_error": executeErr.Error()}
+		decision := classifyRuntimeFailure(executeErr, executionContextErr)
+		result.Output = map[string]any{
+			"execution_error": executeErr.Error(),
+			"failure_class":   decision.Class,
+			"recovery_action": decision.Action,
+			"retry_level":     decision.RetryLevel,
+			"retryable":       decision.Retryable,
+		}
 		result.Checks = map[string]bool{"execution": false}
 		result.QualityScore = 0
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			result.Output["error_code"] = "EXECUTION_TIMEOUT"
+		if decision.Class == failure.PolicyViolation {
+			// Runtime 的结构化结论只能增加策略违规；数据库 system.policy Gate 还会
+			// 独立检查 DENIED ToolCall，模型无法通过伪造空数组把它抹掉。
+			result.PolicyViolations = append(result.PolicyViolations, executeErr.Error())
 		}
 	}
-	if err := r.store.CompleteAttempt(parent, work.Attempt.ID, result); err != nil {
+	if err := r.store.CompleteAttempt(parent, owner, result); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("提交 attempt %s 结果: %w", work.Attempt.ID, err)
@@ -187,7 +210,35 @@ func (r *Runtime) handle(parent context.Context, message assignment.Message) err
 	return nil
 }
 
-func (r *Runtime) heartbeat(ctx context.Context, attemptID uuid.UUID, message assignment.Message, done chan<- struct{}) {
+func keepAttemptOpen(err error) bool {
+	return errors.Is(err, toolgateway.ErrApprovalPending) ||
+		errors.Is(err, toolgateway.ErrEffectReconcileRequired)
+}
+
+// classifyRuntimeFailure 把已知类型优先映射成结构化 Hint，再由 failure 包兼容 Provider/MCP
+// 文本错误。这里不直接执行恢复动作：Checkpoint、UNKNOWN Reconcile 已在当前边界处理，
+// 其余 Decision 会随 Attempt 证据持久化，交由 Reviewer/Recovery/Replanner 做分层恢复。
+func classifyRuntimeFailure(err, executionContextErr error) failure.Decision {
+	hint := failure.Hint{}
+	switch {
+	case errors.Is(err, toolgateway.ErrDenied):
+		hint.Class = failure.PolicyViolation
+	case errors.Is(err, contextengine.ErrBudgetTooSmall):
+		hint.Class = failure.ContextOverflow
+	case errors.Is(err, agentloop.ErrGuardExceeded):
+		if strings.Contains(strings.ToLower(err.Error()), "没有进展") ||
+			strings.Contains(strings.ToLower(err.Error()), "no progress") {
+			hint.Class = failure.NoProgress
+		} else {
+			hint.Class = failure.BudgetExceeded
+		}
+	case errors.Is(executionContextErr, context.DeadlineExceeded):
+		hint.Class = failure.NetworkTemporary
+	}
+	return failure.Classify(err, hint)
+}
+
+func (r *Runtime) heartbeat(ctx context.Context, owner execution.AttemptOwner, message assignment.Message, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(r.heartbeatInterval)
 	defer ticker.Stop()
@@ -196,11 +247,11 @@ func (r *Runtime) heartbeat(ctx context.Context, attemptID uuid.UUID, message as
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := r.store.HeartbeatAttempt(ctx, attemptID, r.workerID); err != nil {
-				r.logger.Warnf("刷新 attempt %s 心跳失败: %v", attemptID, err)
+			if err := r.store.HeartbeatAttempt(ctx, owner); err != nil {
+				r.logger.Warnf("刷新 attempt %s 心跳失败: %v", owner.AttemptID, err)
 			}
 			if err := message.InProgress(); err != nil {
-				r.logger.Warnf("延长 attempt %s JetStream ACK 等待失败: %v", attemptID, err)
+				r.logger.Warnf("延长 attempt %s JetStream ACK 等待失败: %v", owner.AttemptID, err)
 			}
 		}
 	}
@@ -215,16 +266,27 @@ func (r *Runtime) wait(ctx context.Context, delay time.Duration) {
 	}
 }
 
+// checkpointResumeSequence 同时兼容同一 Attempt 消息重放和新 Attempt 从上一恢复点继续。
+// sequence 只增不减，避免恢复后覆盖旧的 typed Step 编号。
+func checkpointResumeSequence(work *execution.Work) int32 {
+	sequence := work.Attempt.StepCount
+	if work.LatestCheckpoint != nil && work.LatestCheckpoint.Sequence > sequence {
+		sequence = work.LatestCheckpoint.Sequence
+	}
+	return sequence
+}
+
 type checkpointWriter struct {
-	store     execution.Store
-	attemptID uuid.UUID
-	sequence  int32
+	store    execution.Store
+	owner    execution.AttemptOwner
+	sequence int32
 }
 
 func (w *checkpointWriter) Save(ctx context.Context, step string, state map[string]any, artifacts []string) error {
 	w.sequence++
-	return w.store.SaveCheckpoint(ctx, execution.Checkpoint{
-		ID: uuid.New(), AttemptID: w.attemptID, Sequence: w.sequence,
-		StepName: step, State: state, ArtifactRefs: artifacts, CreatedAt: time.Now().UTC(),
+	return w.store.SaveCheckpoint(ctx, w.owner, execution.Checkpoint{
+		ID: uuid.New(), AttemptID: w.owner.AttemptID, Sequence: w.sequence,
+		StepName: step, State: state, ArtifactRefs: artifacts,
+		FencingToken: w.owner.FencingToken, CreatedAt: time.Now().UTC(),
 	})
 }

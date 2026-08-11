@@ -6,19 +6,30 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/licy-yu/agent-os/internal/agentloop"
+	"github.com/licy-yu/agent-os/internal/contextengine"
 	"github.com/licy-yu/agent-os/internal/execution"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/responses"
 )
 
 // Router 保留确定性执行器用于测试/私有模型，并把其他模型交给 OpenAI Responses API。
+// 两条路径都会先包进同一张 Eino Attempt Graph，因此开发模式不会绕过生产 Runtime Guard。
 type Router struct {
 	deterministic execution.Executor
 	openAI        execution.Executor
 }
 
-func NewRouter(openAI execution.Executor) *Router {
-	return &Router{deterministic: DeterministicExecutor{}, openAI: openAI}
+func NewRouter(openAI execution.Executor) (*Router, error) {
+	deterministic, err := agentloop.New(DeterministicExecutor{})
+	if err != nil {
+		return nil, fmt.Errorf("初始化确定性 Eino Runtime: %w", err)
+	}
+	production, err := agentloop.New(openAI)
+	if err != nil {
+		return nil, fmt.Errorf("初始化生产 Eino Runtime: %w", err)
+	}
+	return &Router{deterministic: deterministic, openAI: production}, nil
 }
 
 func (r *Router) ForModel(model string) execution.Executor {
@@ -84,15 +95,18 @@ func NewOpenAIExecutor() *OpenAIExecutor {
 func (e *OpenAIExecutor) Execute(ctx context.Context, work *execution.Work,
 	checkpoints execution.CheckpointWriter, _ execution.ToolCaller,
 ) (execution.ExecutionResult, error) {
-	input, err := json.Marshal(map[string]any{
-		"task_id": work.Task.ID, "goal": work.Task.Goal, "input": work.Task.Input,
-		"acceptance": work.Task.Acceptance,
-	})
+	pack, err := contextengine.Build(work)
+	if err != nil {
+		return execution.ExecutionResult{}, fmt.Errorf("构建 ContextPack: %w", err)
+	}
+	input, err := json.Marshal(pack)
 	if err != nil {
 		return execution.ExecutionResult{}, fmt.Errorf("序列化模型输入: %w", err)
 	}
 	if err := checkpoints.Save(ctx, "model_request", map[string]any{
 		"model": work.Template.Model, "input_bytes": len(input),
+		"context_tokens": pack.UsedTokens, "context_sources": len(pack.Sections),
+		"omitted_sources": len(pack.Omitted),
 	}, nil); err != nil {
 		return execution.ExecutionResult{}, err
 	}

@@ -24,6 +24,7 @@ type fakeStore struct {
 	transitions  []fakeTransition
 	replan       *CreateRecord
 	replanReason string
+	workflowRef  WorkflowRef
 }
 
 type fakeTransition struct {
@@ -112,6 +113,31 @@ func (s *fakeStore) GetPlan(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (*
 	return nil, domain.ErrNotFound
 }
 
+func (s *fakeStore) AttachWorkflow(_ context.Context, tenantID, runID uuid.UUID, ref WorkflowRef) error {
+	if s.current == nil || s.current.ID != runID || s.current.TenantID != tenantID {
+		return domain.ErrNotFound
+	}
+	s.workflowRef = ref
+	s.current.TemporalWorkflowID, s.current.TemporalRunID = ref.WorkflowID, ref.RunID
+	return nil
+}
+
+type fakeRuntime struct {
+	ready   bool
+	started int
+	signals []string
+}
+
+func (r *fakeRuntime) Ready() bool { return r.ready }
+func (r *fakeRuntime) StartRun(_ context.Context, _ *RunView) (WorkflowRef, error) {
+	r.started++
+	return WorkflowRef{WorkflowID: "swarmos/run/test", RunID: "temporal-run-1"}, nil
+}
+func (r *fakeRuntime) SignalRun(_ context.Context, _ uuid.UUID, command, _ string, _ int32, _ map[string]any) error {
+	r.signals = append(r.signals, command)
+	return nil
+}
+
 func TestCreateBuildsDeterministicDefaultPlan(t *testing.T) {
 	tenantID := uuid.New()
 	runID := uuid.New()
@@ -169,6 +195,19 @@ func TestCreateRejectsMissingAgentCatalog(t *testing.T) {
 	require.True(t, errors.Is(err, ErrInvalidRequest))
 	require.ErrorContains(t, err, "没有启用的 Agent 能力")
 	require.Nil(t, store.created, "Catalog 不可执行时不得留下半成品 Run")
+}
+
+func TestCreateTemporalStartsIdempotentWorkflowAndPersistsReference(t *testing.T) {
+	store := &fakeStore{catalog: validCatalog()}
+	runtime := &fakeRuntime{ready: true}
+	service := NewService(store, false).WithDurableRuntime(runtime)
+	view, err := service.Create(context.Background(), CreateRunRequest{
+		Name: "durable", Goal: "长时间运行", ExecutionEngine: "TEMPORAL",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, runtime.started)
+	require.Equal(t, "swarmos/run/test", store.workflowRef.WorkflowID)
+	require.Equal(t, "temporal-run-1", view.TemporalRunID)
 }
 
 func TestPauseResumeCancelUseRunStateMachineAndCAS(t *testing.T) {
