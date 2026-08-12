@@ -15,7 +15,7 @@ SwarmOS 把一次用户目标建模为可审计的 `Run -> PlanVersion -> Task -
 
 旧 `/api/v1/swarms`、AgentTemplate、Agent、Task API 保留；新能力以 `/api/v1/runs` 为入口。详细边界见 [V1.5 架构](docs/architecture.md) 与 [15 项验收矩阵](docs/v1.5-acceptance.md)。
 
-2026-08-11 已在 Ubuntu 虚拟机上用 production Compose 完成 V1.5 基础部署，并发布 V1.5.4：生产应用镜像为 `swarmos-app:v1.5.4`，源码提交为 `6fd6043`，已推送到[公开 GitHub 分支](https://github.com/licy-yu/agent-os/tree/codex/swarmos-v15-production)。正常空转 Run `927451fd-8590-4ae1-a8ae-a439d6bc9996` 的 Task 在 10 秒内保持 `version=1`、Outbox `=1`、Explain `=1`、`xmin=649540`，随后 COMPLETED，Manifest `c3e3ffe0-51ba-5a6d-b041-ec09164d4083` HTTP 200；API Key 使用的 `0600` Header 临时文件执行前后数量均为 0。崩溃注入 Run `b935dd37-2594-4148-b20c-9ccd5014c27d` 的 Task `b11fd38f-88c4-4fa2-9e26-fb97b68ebefd` 被人工置为 SCHEDULING/version 2，Controller 恢复为 READY/version 3 且只产生 1 条 `task.ready`，随后 COMPLETED，Manifest `84adba6c-7127-5ee8-bf96-1bb11772bffe` HTTP 200。V1.5.4 采用 `max(2 × Lease TTL, 1 分钟)` 的过期阈值，并以数据库 CAS 保证多副本只有一个恢复者。这些证据不代表设计文档中的 15 项故障注入用例已经全部通过。UFW 放行后使用的局域网入口为 `http://192.168.110.128:8080/`，Windows 宿主机直连仍待用户执行 LAN 白名单后复测；完整证据、剩余边界和回滚信息见 [V1.5 目标 VM 部署报告](docs/v1.5-deployment-report.md)。
+2026-08-12 已发布前端体验版 V1.5.5：生产应用镜像为 `swarmos-app:v1.5.5`，源码提交为 `37f89b6`，已推送到[公开 GitHub 分支](https://github.com/licy-yu/agent-os/tree/codex/swarmos-v15-production)。新版将控制台重构为响应式 AI 任务指挥中心，保留全部 Run/Task/Attempt/Artifact/Scheduler/Interaction 能力并加入可降级动画；生产冒烟、健康/就绪探针和 Temporal Workflow/Activity Poller 均已通过。V1.5.4 的正常运行与崩溃恢复证据继续有效，但不代表设计文档中的 15 项故障注入用例已经全部通过。局域网入口为 `http://192.168.110.128:8080/`；Windows 宿主机仍需在虚拟机执行 `sudo ufw allow from 192.168.110.1 to any port 8080 proto tcp`，也可先通过 SSH 隧道访问。完整证据、剩余边界和回滚信息见 [V1.5 目标 VM 部署报告](docs/v1.5-deployment-report.md)。
 
 ## 技术基线
 
