@@ -5,12 +5,17 @@ set -Eeuo pipefail
 base_url="${SWARMOS_BASE_URL:-http://127.0.0.1:8080}"
 worker_metrics_url="${SWARMOS_WORKER_METRICS_URL:-http://127.0.0.1:9465/metrics}"
 : "${SWARMOS_API_KEY:?请先从部署 .env 加载 SWARMOS_API_KEY，冒烟脚本不会打印它}"
+# 先保存到未导出的 Shell 变量，再从环境移除。这样后续 curl 既不会在命令行参数中
+# 暴露密钥，也不会从 /proc/<pid>/environ 继承它；printf 是 Bash 内建命令，密钥只经
+# 匿名管道送入 curl 的标准输入，不产生落盘临时文件。
+api_key="${SWARMOS_API_KEY}"
+unset SWARMOS_API_KEY
 
-# 所有业务 API 都走与浏览器相同的 Bearer 认证。Key 只驻留当前进程环境，不写临时文件、
+# 所有业务 API 都走与浏览器相同的 Bearer 认证。Key 不进入 curl 参数、不写临时文件、
 # 不进入脚本输出；healthz/readyz/metrics 则故意保持未认证，供容器探针读取。
 api_get() {
-  curl --fail --silent --show-error \
-    --header "Authorization: Bearer ${SWARMOS_API_KEY}" "$1"
+  printf 'header = "Authorization: Bearer %s"\n' "${api_key}" |
+    curl --config - --fail --silent --show-error "$1"
 }
 
 health="$(curl --fail --silent --show-error "${base_url}/healthz")"
@@ -41,7 +46,7 @@ fi
 page="$(curl --fail --silent --show-error "${base_url}/")"
 control_metrics="$(curl --fail --silent --show-error "${base_url}/metrics")"
 worker_metrics="$(curl --fail --silent --show-error "${worker_metrics_url}")"
-grep --quiet "SwarmOS Control Room" <<<"${page}"
+grep --quiet "SwarmOS AI 任务指挥中心" <<<"${page}"
 grep --quiet "swarmos_server_requests_total" <<<"${control_metrics}"
 grep --quiet "go_goroutines" <<<"${worker_metrics}"
 

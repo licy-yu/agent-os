@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
   type FormEvent,
@@ -143,7 +144,7 @@ function safeJSON(value: unknown) {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  return <span className={`status-badge ${statusTone(status)}`}><i />{status}</span>
+  return <span className={`status-badge ${statusTone(status)}`} title={`当前状态：${status}`}><i aria-hidden="true" />{status}</span>
 }
 
 function MetricCard({ icon, label, value, note, tone = 'cyan' }: {
@@ -157,6 +158,7 @@ function MetricCard({ icon, label, value, note, tone = 'cyan' }: {
     <article className={`metric-card ${tone}`}>
       <div className="metric-icon">{icon}</div>
       <div><p>{label}</p><strong>{value}</strong><small>{note}</small></div>
+      <span className="metric-spark" aria-hidden="true"><i /><i /><i /><i /><i /></span>
     </article>
   )
 }
@@ -175,7 +177,7 @@ function RunRail({ runs, selectedID, query, onQuery, onSelect }: {
   const visibleRuns = runs.filter((run) => `${run.name} ${run.goal} ${run.id}`.toLowerCase().includes(query.toLowerCase()))
   return (
     <section className="run-rail" aria-labelledby="run-list-title">
-      <div className="run-rail-heading"><p id="run-list-title">RUNS</p><span>{runs.length}</span></div>
+      <div className="run-rail-heading"><p id="run-list-title">运行实例</p><span>{runs.length}</span></div>
       <label className="run-search"><Search size={13} /><span className="sr-only">搜索 Run</span><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索运行" /></label>
       <div className="run-list">
         {visibleRuns.map((run) => (
@@ -231,7 +233,7 @@ function DAGBoard({ tasks, selectedID, onSelect }: {
       <div className="dag-board">
         {layers.map(([layer, items], index) => (
           <div className="dag-stage" key={layer}>
-            <div className="stage-label"><span>{String(layer + 1).padStart(2, '0')}</span> STAGE</div>
+            <div className="stage-label"><span>{String(layer + 1).padStart(2, '0')}</span> 执行阶段</div>
             <div className="stage-nodes">
               {items.map((task) => (
                 <button
@@ -240,6 +242,7 @@ function DAGBoard({ tasks, selectedID, onSelect }: {
                   className={`task-node ${selectedID === task.id ? 'selected' : ''}`}
                   onClick={() => onSelect(task)}
                   aria-label={`查看任务 ${task.name}`}
+                  aria-pressed={selectedID === task.id}
                 >
                   <div className="node-top"><StatusBadge status={task.status} /><span>P{task.priority}</span></div>
                   <strong>{task.name}</strong>
@@ -252,7 +255,7 @@ function DAGBoard({ tasks, selectedID, onSelect }: {
                 </button>
               ))}
             </div>
-            {index < layers.length - 1 && <div className="flow-arrow"><ChevronRight size={18} /></div>}
+            {index < layers.length - 1 && <div className="flow-arrow" aria-hidden="true"><i /><ChevronRight size={18} /></div>}
           </div>
         ))}
       </div>
@@ -358,7 +361,7 @@ function TaskInspector({ task, attempts, loading }: { task?: Task; attempts: Att
 function TimelinePanel({ items }: { items: TimelineItem[] }) {
   return (
     <section className="panel timeline-panel" id="timeline">
-      <div className="panel-heading"><div><span className="eyebrow">RUN EVENT PROJECTION</span><h2>Timeline</h2></div><span className="panel-count">{items.length} EVENTS</span></div>
+      <div className="panel-heading"><div><span className="eyebrow">运行事件投影</span><h2>执行时间线</h2></div><span className="panel-count">{items.length} 条事件</span></div>
       {items.length === 0 ? <EmptyState icon={<Activity size={25} />}>尚无 Timeline 事件</EmptyState> : (
         <div className="timeline-list">
           {items.slice(0, 40).map((item) => (
@@ -380,7 +383,7 @@ function TimelinePanel({ items }: { items: TimelineItem[] }) {
 function ArtifactPanel({ items }: { items: Artifact[] }) {
   return (
     <section className="panel artifact-panel" id="artifacts">
-      <div className="panel-heading"><div><span className="eyebrow">VERSIONED OUTPUT</span><h2>Artifacts</h2></div><PackageOpen size={18} /></div>
+      <div className="panel-heading"><div><span className="eyebrow">可追溯版本输出</span><h2>交付物</h2></div><PackageOpen size={18} /></div>
       {items.length === 0 ? <EmptyState icon={<FileBox size={25} />}>当前 Run 尚无可追踪 Artifact</EmptyState> : (
         <div className="artifact-list">
           {items.slice(0, 16).map((item) => (
@@ -400,7 +403,7 @@ function SchedulerPanel({ items, selectedTaskID }: { items: SchedulerDecision[];
   const visible = selectedTaskID ? items.filter((item) => !item.taskId || item.taskId === selectedTaskID) : items
   return (
     <section className="panel scheduler-panel" id="scheduler-explain">
-      <div className="panel-heading"><div><span className="eyebrow">FILTER / SCORE / BIND</span><h2>Scheduler Explain</h2></div><CircleGauge size={18} /></div>
+      <div className="panel-heading"><div><span className="eyebrow">筛选 / 评分 / 绑定</span><h2>调度决策</h2></div><CircleGauge size={18} /></div>
       {visible.length === 0 ? <EmptyState icon={<ListTree size={25} />}>尚无可展示的调度解释</EmptyState> : (
         <div className="decision-list">
           {visible.slice(0, 12).map((item) => (
@@ -434,7 +437,7 @@ function InteractionInbox({ items, busyID, onAction }: {
   const [responses, setResponses] = useState<Record<string, string>>({})
   return (
     <section className="panel inbox-panel" id="inbox">
-      <div className="panel-heading"><div><span className="eyebrow">HUMAN INTERACTION</span><h2>Approval / Input Inbox</h2></div><span className={`inbox-count ${items.length ? 'pending' : ''}`}>{items.length} PENDING</span></div>
+      <div className="panel-heading"><div><span className="eyebrow">人在回路控制</span><h2>审批与输入</h2></div><span className={`inbox-count ${items.length ? 'pending' : ''}`}>{items.length} 项待处理</span></div>
       {items.length === 0 ? <EmptyState icon={<Inbox size={27} />}>当前没有待处理的审批或输入</EmptyState> : (
         <div className="interaction-grid">
           {items.map((item) => {
@@ -469,12 +472,58 @@ function InteractionInbox({ items, busyID, onAction }: {
   )
 }
 
+// 弹窗关闭后把焦点交还给触发按钮；同时把 Tab 限制在弹窗内部，避免键盘用户
+// 在半透明遮罩背后误操作运行命令。onClose 通过 ref 取最新值，避免父组件重渲染
+// 时重复安装全局监听器。
+function useModalKeyboard(onClose: () => void, returnFocusID: string) {
+  const dialogRef = useRef<HTMLElement>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : undefined
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onCloseRef.current()
+        return
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return
+      const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      )].filter((element) => !element.hidden)
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      const explicitTrigger = document.getElementById(returnFocusID)
+      if (explicitTrigger instanceof HTMLElement) explicitTrigger.focus()
+      else previousFocus?.focus()
+    }
+  }, [])
+
+  return dialogRef
+}
+
 function CreateRunDialog({ legacy, busy, onClose, onSubmit }: {
   legacy: boolean
   busy: boolean
   onClose: () => void
   onSubmit: (input: CreateRunInput) => Promise<void>
 }) {
+  const dialogRef = useModalKeyboard(onClose, 'create-run-trigger')
   const [form, setForm] = useState<CreateRunInput>({
     name: '', goal: '', tokenBudget: 300_000,
     costBudgetMicros: 5_000_000, maxAgents: 4, executionEngine: 'TEMPORAL',
@@ -485,7 +534,7 @@ function CreateRunDialog({ legacy, busy, onClose, onSubmit }: {
   }
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="create-run-title">
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="create-run-title">
         <div className="modal-heading"><div><span className="eyebrow">NEW OPERATION</span><h2 id="create-run-title">创建 {legacy ? 'Legacy Swarm' : 'Run'}</h2></div><button type="button" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
         <form onSubmit={submit}>
           <label><span>名称</span><input required maxLength={128} autoFocus value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：发布 SwarmOS V1.5" /></label>
@@ -509,6 +558,7 @@ function ReplanDialog({ currentGoal, busy, onClose, onSubmit }: {
   onClose: () => void
   onSubmit: (reason: string, goal: string) => Promise<void>
 }) {
+  const dialogRef = useModalKeyboard(onClose, 'replan-trigger')
   const [reason, setReason] = useState('')
   const [goal, setGoal] = useState(currentGoal)
   const submit = (event: FormEvent) => {
@@ -517,7 +567,7 @@ function ReplanDialog({ currentGoal, busy, onClose, onSubmit }: {
   }
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="replan-title">
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="replan-title">
         <div className="modal-heading"><div><span className="eyebrow">PLAN VERSION</span><h2 id="replan-title">生成新计划</h2></div><button type="button" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
         <form onSubmit={submit}>
           <label><span>重新规划原因</span><textarea required autoFocus rows={3} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="说明环境变化、失败原因或目标调整" /></label>
@@ -771,22 +821,22 @@ export function App() {
     <>
       <div className="app-shell">
         <aside className="sidebar">
-          <div className="brand"><div className="brand-mark"><Sparkles size={18} /></div><div><strong>SWARM<span>/OS</span></strong><small>OPERATIONS CONSOLE</small></div></div>
+          <div className="brand"><div className="brand-mark"><Sparkles size={18} /></div><div><strong>SWARM<span>/OS</span></strong><small>AI 任务指挥中心</small></div></div>
           <nav aria-label="主导航">
             <a className="active" href="#overview"><CircleGauge size={18} /><span>Run 总览</span></a>
             <a href="#dag"><Workflow size={18} /><span>任务编排</span><em>{activeTasks}</em></a>
-            <a href="#timeline"><Activity size={18} /><span>Timeline</span></a>
-            <a href="#artifacts"><FileBox size={18} /><span>Artifacts</span></a>
+            <a href="#timeline"><Activity size={18} /><span>执行时间线</span></a>
+            <a href="#artifacts"><FileBox size={18} /><span>交付物</span></a>
             <a href="#inbox"><Inbox size={18} /><span>审批与输入</span>{interactions.length > 0 && <em className="warning">{interactions.length}</em>}</a>
           </nav>
           <RunRail runs={runs} selectedID={selectedRunID} query={runQuery} onQuery={setRunQuery} onSelect={setSelectedRunID} />
           <div className="sidebar-infra">
-            <p>INFRASTRUCTURE</p>
+            <p>基础设施状态</p>
             <div><Database size={14} /><span>PostgreSQL</span><i /></div>
-            <div><Zap size={14} /><span>Durable Events</span><i /></div>
-            <div><Cpu size={14} /><span>Worker Pool</span><i /></div>
+            <div><Zap size={14} /><span>持久化事件</span><i /></div>
+            <div><Cpu size={14} /><span>执行节点池</span><i /></div>
           </div>
-          <div className="sidebar-foot"><ServerCog size={17} /><div><strong>V1.5 · OPS</strong><small>{legacyAPI ? 'compatibility mode' : 'durable runtime'}</small></div></div>
+          <div className="sidebar-foot"><ServerCog size={17} /><div><strong>V1.5 · OPS</strong><small>{legacyAPI ? '兼容运行模式' : '持久化运行时'}</small></div></div>
         </aside>
 
         <main>
@@ -795,9 +845,9 @@ export function App() {
             <div className="top-actions">
               <button className={`auth-key-button ${apiKeyConfigured ? 'configured' : ''}`} type="button" onClick={configureAPIKey} title="配置 API Key"><KeyRound size={14} /><span>{apiKeyConfigured ? 'KEY SET' : 'API KEY'}</span></button>
               <label className="run-select"><Boxes size={15} /><span className="sr-only">选择 Run</span><select value={selectedRunID} onChange={(event) => setSelectedRunID(event.target.value)}>{runs.map((run) => <option key={run.id} value={run.id}>{run.name}</option>)}</select></label>
-              <button className="new-run-button" type="button" onClick={() => setShowCreate(true)}><Plus size={15} /><span>新建 Run</span></button>
+              <button id="create-run-trigger" className="new-run-button" type="button" onClick={() => setShowCreate(true)}><Plus size={15} /><span>新建 Run</span></button>
               <button className="refresh-button" type="button" aria-label="刷新数据" disabled={!selectedRun} onClick={() => selectedRun && void loadRuntime(selectedRun)}><RefreshCw size={16} className={refreshing ? 'spin' : ''} /></button>
-              <div className="live-pill"><i />LIVE</div>
+              <div className="live-pill"><i />实时</div>
             </div>
           </header>
 
@@ -808,28 +858,29 @@ export function App() {
             {selectedRun?.legacy && <div className="compat-banner"><AlertTriangle size={16} /><div><strong>Legacy API 降级模式</strong><span>当前后端尚未提供 Run 动作、Artifact、Scheduler Explain 和 Interaction；现有 Swarm 数据仍可只读查看。</span></div></div>}
 
             <section className="hero-section">
-              <div className="hero-copy"><span className="eyebrow">RUN OPERATION / {shortID(selectedRunID)}</span><h1>{selectedRun?.name ?? 'SwarmOS Operations Console'}</h1><p>{selectedRun?.goal ?? (loading ? '正在连接运行控制面…' : '创建第一个 Run，将长期任务纳入可恢复、可验证的执行链路。')}</p>{selectedRun?.deadlineAt && <small><Clock3 size={13} /> DEADLINE {formatDate(selectedRun.deadlineAt)}</small>}</div>
+              <div className="hero-orb orb-one" aria-hidden="true" /><div className="hero-orb orb-two" aria-hidden="true" />
+              <div className="hero-copy"><span className="eyebrow">运行任务 / {shortID(selectedRunID)}</span><h1>{selectedRun?.name ?? 'SwarmOS AI 任务指挥中心'}</h1><p>{selectedRun?.goal ?? (loading ? '正在连接运行控制面…' : '创建第一个 Run，将长期任务纳入可恢复、可验证的执行链路。')}</p>{selectedRun?.deadlineAt && <small><Clock3 size={13} /> 截止时间 {formatDate(selectedRun.deadlineAt)}</small>}</div>
               <div className="hero-right">
-                <div className="hero-progress"><div className="progress-ring" style={{ '--progress': `${progress * 3.6}deg` } as CSSProperties}><strong>{progress}%</strong><span>DONE</span></div><div><small>RUN STATUS</small><StatusBadge status={selectedRun?.status ?? 'CREATED'} /><p>{completedTasks}/{totalTasks} tasks completed</p></div></div>
+                <div className="hero-progress"><div className="progress-ring" role="progressbar" aria-label="Run 完成进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress} style={{ '--progress': `${progress * 3.6}deg` } as CSSProperties}><strong>{progress}%</strong><span>已完成</span></div><div><small>运行状态</small><StatusBadge status={selectedRun?.status ?? 'CREATED'} /><p>{completedTasks}/{totalTasks} 个任务已完成</p></div></div>
                 <div className="run-actions" aria-label="Run 操作">
-                  <button type="button" disabled={!canPause || Boolean(actionBusy)} onClick={() => void handleRunAction('pause')}><Pause size={14} />Pause</button>
-                  <button type="button" disabled={!canResume || Boolean(actionBusy)} onClick={() => void handleRunAction('resume')}><Play size={14} />Resume</button>
-                  <button type="button" disabled={!canMutate || Boolean(actionBusy)} onClick={() => setShowReplan(true)}><RotateCcw size={14} />Replan</button>
-                  <button type="button" className="danger" disabled={!canMutate || Boolean(actionBusy)} onClick={() => void handleRunAction('cancel')}><XCircle size={14} />Cancel</button>
+                  <button type="button" disabled={!canPause || Boolean(actionBusy)} onClick={() => void handleRunAction('pause')}><Pause size={14} />暂停</button>
+                  <button type="button" disabled={!canResume || Boolean(actionBusy)} onClick={() => void handleRunAction('resume')}><Play size={14} />继续</button>
+                  <button id="replan-trigger" type="button" disabled={!canMutate || Boolean(actionBusy)} onClick={() => setShowReplan(true)}><RotateCcw size={14} />重新规划</button>
+                  <button type="button" className="danger" disabled={!canMutate || Boolean(actionBusy)} onClick={() => void handleRunAction('cancel')}><XCircle size={14} />取消运行</button>
                 </div>
               </div>
             </section>
 
             <section className="metrics-grid">
-              <MetricCard icon={<Workflow size={21} />} label="TASK GRAPH" value={`${completedTasks} / ${totalTasks}`} note={`${activeTasks} 个任务仍在流转`} />
-              <MetricCard icon={<Bot size={21} />} label="AGENT CAPACITY" value={`${onlineAgents} / ${agents.length}`} note={`${overview?.agent_statuses.RUNNING ?? 0} 个实例执行中`} tone="lime" />
-              <MetricCard icon={<Cpu size={21} />} label="TOKEN BUDGET" value={`${tokenUsage}%`} note={`${formatNumber(tokenUsed)} / ${formatNumber(tokenBudget)}`} tone="amber" />
-              <MetricCard icon={<Coins size={21} />} label="RUN COST" value={formatCost(costUsed)} note={`${formatCost(costBudget)} budget · ${selectedRunInteractions.length} pending`} tone="violet" />
+              <MetricCard icon={<Workflow size={21} />} label="任务图进度" value={`${completedTasks} / ${totalTasks}`} note={`${activeTasks} 个任务仍在流转`} />
+              <MetricCard icon={<Bot size={21} />} label="智能体容量" value={`${onlineAgents} / ${agents.length}`} note={`${overview?.agent_statuses.RUNNING ?? 0} 个实例执行中`} tone="lime" />
+              <MetricCard icon={<Cpu size={21} />} label="TOKEN 预算" value={`${tokenUsage}%`} note={`${formatNumber(tokenUsed)} / ${formatNumber(tokenBudget)}`} tone="amber" />
+              <MetricCard icon={<Coins size={21} />} label="运行成本" value={formatCost(costUsed)} note={`${formatCost(costBudget)} 预算 · ${selectedRunInteractions.length} 项待处理`} tone="violet" />
             </section>
 
             <div className="primary-grid">
               <section className="panel dag-panel" id="dag">
-                <div className="panel-heading"><div><span className="eyebrow">DECLARATIVE ORCHESTRATION</span><h2>Task DAG</h2></div><div className="legend"><span className="success">成功</span><span className="active">运行</span><span className="warning">等待</span></div></div>
+                <div className="panel-heading"><div><span className="eyebrow">声明式任务编排</span><h2>任务 DAG</h2></div><div className="legend"><span className="success">成功</span><span className="active">运行</span><span className="warning">等待</span></div></div>
                 {loading && tasks.length === 0 ? <div className="loading-lines"><i /><i /><i /></div> : <DAGBoard tasks={tasks} selectedID={selectedTask?.id} onSelect={selectTask} />}
               </section>
               <TaskInspector task={selectedTask} attempts={attempts} loading={attemptLoading} />
@@ -846,7 +897,7 @@ export function App() {
             <InteractionInbox items={interactions} busyID={interactionBusy} onAction={handleInteraction} />
 
             <section className="panel agents-panel" id="agents">
-              <div className="panel-heading"><div><span className="eyebrow">RUNTIME SLOTS</span><h2>Agent Fleet</h2></div><span className="panel-count">{agents.length} INSTANCES</span></div>
+              <div className="panel-heading"><div><span className="eyebrow">运行时执行槽位</span><h2>智能体集群</h2></div><span className="panel-count">{agents.length} 个实例</span></div>
               <div className="agent-list">
                 {agents.length === 0 && <EmptyState icon={<Bot size={26} />}>没有注册 Agent</EmptyState>}
                 {agents.map((agent) => (
@@ -859,7 +910,7 @@ export function App() {
                 ))}
               </div>
             </section>
-            <footer><span>SWARMOS / V1.5 OPERATIONS CONSOLE</span><span>{lastUpdated ? `UPDATED ${formatTime(lastUpdated.toISOString())}` : 'CONNECTING'} · AUTO REFRESH 5S</span></footer>
+            <footer><span>SWARMOS / V1.5 AI 任务指挥中心</span><span>{lastUpdated ? `更新于 ${formatTime(lastUpdated.toISOString())}` : '正在连接'} · 每 5 秒自动刷新</span></footer>
           </div>
         </main>
       </div>
