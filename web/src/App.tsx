@@ -79,6 +79,14 @@ const terminalTaskStatuses = new Set([
   'SUCCEEDED', 'COMPLETED', 'FAILED', 'CANCELED', 'REJECTED', 'SUPERSEDED',
 ])
 const terminalRunStatuses = new Set(['COMPLETED', 'SUCCEEDED', 'FAILED', 'CANCELED'])
+const navigationSectionIDs = ['overview', 'dag', 'timeline', 'artifacts', 'inbox'] as const
+type NavigationSectionID = (typeof navigationSectionIDs)[number]
+
+function navigationSectionFromHash(): NavigationSectionID {
+  if (typeof window === 'undefined') return 'overview'
+  const candidate = window.location.hash.slice(1) as NavigationSectionID
+  return navigationSectionIDs.includes(candidate) ? candidate : 'overview'
+}
 
 function shortID(value?: string) {
   return value ? value.slice(0, 8) : '—'
@@ -174,7 +182,13 @@ function RunRail({ runs, selectedID, query, onQuery, onSelect }: {
   onQuery: (value: string) => void
   onSelect: (id: string) => void
 }) {
-  const visibleRuns = runs.filter((run) => `${run.name} ${run.goal} ${run.id}`.toLowerCase().includes(query.toLowerCase()))
+  const matchingRuns = runs.filter((run) => `${run.name} ${run.goal} ${run.id}`.toLowerCase().includes(query.toLowerCase()))
+  const selectedRun = runs.find((run) => run.id === selectedID)
+  // 搜索条件不匹配当前 Run 时仍把它固定在首位，否则右侧正在展示详情，左侧却看不到
+  // 任何选中项，会给人一种“菜单选丢了”的错觉。
+  const visibleRuns = selectedRun && !matchingRuns.some((run) => run.id === selectedID)
+    ? [selectedRun, ...matchingRuns]
+    : matchingRuns
   return (
     <section className="run-rail" aria-labelledby="run-list-title">
       <div className="run-rail-heading"><p id="run-list-title">运行实例</p><span>{runs.length}</span></div>
@@ -265,10 +279,25 @@ function DAGBoard({ tasks, selectedID, onSelect }: {
 
 function TaskInspector({ task, attempts, loading }: { task?: Task; attempts: Attempt[]; loading: boolean }) {
   const [selectedAttemptID, setSelectedAttemptID] = useState('')
+  const attemptTabListRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     setSelectedAttemptID((current) => attempts.some((item) => item.id === current) ? current : attempts[0]?.id ?? '')
   }, [task?.id, attempts])
   const attempt = attempts.find((item) => item.id === selectedAttemptID) ?? attempts[0]
+  const selectAttemptByKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') nextIndex = (index + 1) % attempts.length
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') nextIndex = (index - 1 + attempts.length) % attempts.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = attempts.length - 1
+    else return
+
+    event.preventDefault()
+    setSelectedAttemptID(attempts[nextIndex].id)
+    window.requestAnimationFrame(() => {
+      attemptTabListRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIndex]?.focus()
+    })
+  }
   const contract = task ? {
     input: task.input,
     inputSpec: task.inputSpec,
@@ -307,9 +336,9 @@ function TaskInspector({ task, attempts, loading }: { task?: Task; attempts: Att
             <pre>{safeJSON(contract)}</pre>
           </details>
           {attempts.length > 0 && (
-            <div className="attempt-tabs" aria-label="Attempt 历史">
-              {attempts.map((item) => (
-                <button type="button" key={item.id} className={item.id === attempt?.id ? 'selected' : ''} onClick={() => setSelectedAttemptID(item.id)}>
+            <div ref={attemptTabListRef} className="attempt-tabs" role="tablist" aria-label="Attempt 历史">
+              {attempts.map((item, index) => (
+                <button type="button" role="tab" id={`attempt-tab-${item.id}`} aria-controls="attempt-evidence-panel" key={item.id} className={item.id === attempt?.id ? 'selected' : ''} aria-selected={item.id === attempt?.id} tabIndex={item.id === attempt?.id ? 0 : -1} onClick={() => setSelectedAttemptID(item.id)} onKeyDown={(event) => selectAttemptByKeyboard(event, index)}>
                   #{item.attempt_no}<span>{item.status}</span>
                 </button>
               ))}
@@ -318,7 +347,7 @@ function TaskInspector({ task, attempts, loading }: { task?: Task; attempts: Att
           {!attempt ? (
             <EmptyState icon={<Clock3 size={24} />}>任务尚未产生 Attempt</EmptyState>
           ) : (
-            <>
+            <div id="attempt-evidence-panel" role="tabpanel" tabIndex={0} aria-labelledby={`attempt-tab-${attempt.id}`}>
               <div className="evidence-grid">
                 <div><span>MODEL</span><strong>{attempt.model || '—'}</strong></div>
                 <div><span>TOKENS</span><strong>{formatNumber(attempt.tokens_in + attempt.tokens_out)}</strong></div>
@@ -350,7 +379,7 @@ function TaskInspector({ task, attempts, loading }: { task?: Task; attempts: Att
                   ))}
                 </div>
               </div>
-            </>
+            </div>
           )}
         </div>
       )}
@@ -605,6 +634,13 @@ export function App() {
   const [notice, setNotice] = useState<{ tone: 'success' | 'danger'; text: string }>()
   const [lastUpdated, setLastUpdated] = useState<Date>()
   const [apiKeyConfigured, setAPIKeyConfigured] = useState(() => Boolean(getAPIKey()))
+  const [activeSection, setActiveSection] = useState<NavigationSectionID>(navigationSectionFromHash)
+  const activeSectionRef = useRef<NavigationSectionID>(activeSection)
+  const navigationLockUntilRef = useRef(window.location.hash ? performance.now() + 900 : 0)
+  const runtimeRequestRef = useRef(0)
+  const attemptRequestRef = useRef(0)
+  const selectedRunIDRef = useRef(selectedRunID)
+  selectedRunIDRef.current = selectedRunID
 
   const bootstrap = useCallback(async () => {
     setLoading(true)
@@ -624,9 +660,14 @@ export function App() {
   useEffect(() => { void bootstrap() }, [bootstrap])
 
   const loadRuntime = useCallback(async (baseRun: Run, quiet = false) => {
+    const requestID = ++runtimeRequestRef.current
+    // 除请求序号外还核对当前 Run。这样 Run A 的暂停/重规划命令即使晚于用户切换
+    // 到 Run B 才返回，也不能通过一次新的刷新请求把 B 的界面覆盖回 A。
+    const isCurrent = () => requestID === runtimeRequestRef.current && baseRun.id === selectedRunIDRef.current
     if (!quiet) setRefreshing(true)
     try {
       const detail = await getRun(baseRun)
+      if (!isCurrent()) return
       const currentRun = { ...baseRun, ...detail, legacy: baseRun.legacy }
       setRunDetail(currentRun)
       const [taskResult, agentResult, overviewResult, timelineResult, artifactResult, decisionResult, interactionResult] = await Promise.allSettled([
@@ -638,6 +679,7 @@ export function App() {
         listSchedulerDecisions(currentRun),
         listInteractions(),
       ] as const)
+      if (!isCurrent()) return
 
       if (taskResult.status === 'fulfilled') {
         setTasks(taskResult.value)
@@ -655,26 +697,42 @@ export function App() {
       setError(rejected?.status === 'rejected' ? `部分运行数据读取失败：${errorMessage(rejected.reason)}` : '')
       setLastUpdated(new Date())
     } catch (reason) {
-      setError(`Run 详情读取失败：${errorMessage(reason)}`)
+      if (isCurrent()) setError(`Run 详情读取失败：${errorMessage(reason)}`)
     } finally {
-      setRefreshing(false)
+      if (isCurrent()) setRefreshing(false)
     }
   }, [])
 
   useEffect(() => {
     const baseRun = runs.find((run) => run.id === selectedRunID)
+    // Run 切换时先作废上一轮异步请求并清空全部 Run 域投影，避免“左侧已选 B，
+    // 右侧仍显示 A”以及慢响应反向覆盖新 Run 的情况。
+    runtimeRequestRef.current += 1
+    attemptRequestRef.current += 1
     if (!baseRun) {
       setRunDetail(undefined)
       setTasks([])
       setAgents([])
+      setOverview(undefined)
       setTimeline([])
       setArtifacts([])
       setDecisions([])
+      setInteractions([])
       setSelectedTask(undefined)
+      setAttempts([])
+      setRefreshing(false)
+      setAttemptLoading(false)
       return
     }
     setRunDetail(undefined)
     setOverview(undefined)
+    setTasks([])
+    setAgents([])
+    setTimeline([])
+    setArtifacts([])
+    setDecisions([])
+    setInteractions([])
+    setSelectedTask(undefined)
     setAttempts([])
     void loadRuntime(baseRun)
     const timer = window.setInterval(() => void loadRuntime(baseRun, true), 5_000)
@@ -682,20 +740,27 @@ export function App() {
   }, [loadRuntime, runs, selectedRunID])
 
   const loadTaskAttempts = useCallback(async (taskID: string, runID: string, quiet = false) => {
+    const requestID = ++attemptRequestRef.current
+    const isCurrent = () => requestID === attemptRequestRef.current
     if (!quiet) setAttemptLoading(true)
     try {
-      setAttempts(await listAttempts(taskID, runID))
+      const result = await listAttempts(taskID, runID)
+      if (isCurrent()) setAttempts(result)
     } catch (reason) {
-      setAttempts([])
-      if (!quiet) setNotice({ tone: 'danger', text: `Attempt 读取失败：${errorMessage(reason)}` })
+      if (isCurrent()) {
+        setAttempts([])
+        if (!quiet) setNotice({ tone: 'danger', text: `Attempt 读取失败：${errorMessage(reason)}` })
+      }
     } finally {
-      setAttemptLoading(false)
+      if (isCurrent()) setAttemptLoading(false)
     }
   }, [])
 
   useEffect(() => {
+    attemptRequestRef.current += 1
     if (!selectedTask?.id) {
       setAttempts([])
+      setAttemptLoading(false)
       return
     }
     void loadTaskAttempts(selectedTask.id, selectedRunID)
@@ -708,6 +773,87 @@ export function App() {
     const timer = window.setTimeout(() => setNotice(undefined), 5_000)
     return () => window.clearTimeout(timer)
   }, [notice])
+
+  // 左侧导航既支持点击锚点，也会随手动滚动更新。导航点击后的平滑滚动期间短暂
+  // 锁定目标，避免中途经过的区块抢走选中态；宽屏下 Timeline 与交付物可能同排，
+  // 因而同一高度优先保留用户明确选择的项目。
+  useEffect(() => {
+    let animationFrame = 0
+    const setCurrentSection = (section: NavigationSectionID, replaceHash: boolean) => {
+      if (activeSectionRef.current === section) return
+      activeSectionRef.current = section
+      setActiveSection(section)
+      if (replaceHash) {
+        const suffix = section === 'overview' ? '' : `#${section}`
+        window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}${suffix}`)
+      }
+    }
+    const syncFromScroll = () => {
+      animationFrame = 0
+      if (performance.now() < navigationLockUntilRef.current) return
+
+      const activationLine = window.scrollY + (window.innerWidth <= 840 ? 78 : 96)
+      let section: NavigationSectionID = 'overview'
+      if (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 8) {
+        section = 'inbox'
+      } else {
+        const passed = navigationSectionIDs
+          .map((id) => ({ id, top: document.getElementById(id)?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY }))
+          .filter((item) => item.top + window.scrollY <= activationLine)
+        if (passed.length > 0) {
+          const closestTop = Math.max(...passed.map((item) => item.top))
+          const sameRow = passed.filter((item) => Math.abs(item.top - closestTop) < 24)
+          section = sameRow.some((item) => item.id === activeSectionRef.current)
+            ? activeSectionRef.current
+            : sameRow[0].id
+        }
+      }
+      setCurrentSection(section, true)
+    }
+    const scheduleSync = () => {
+      if (animationFrame) return
+      animationFrame = window.requestAnimationFrame(syncFromScroll)
+    }
+    const syncFromLocation = () => {
+      const section = navigationSectionFromHash()
+      navigationLockUntilRef.current = performance.now() + 900
+      activeSectionRef.current = section
+      setActiveSection(section)
+    }
+
+    window.addEventListener('scroll', scheduleSync, { passive: true })
+    window.addEventListener('resize', scheduleSync)
+    window.addEventListener('hashchange', syncFromLocation)
+    window.addEventListener('popstate', syncFromLocation)
+    scheduleSync()
+    return () => {
+      window.removeEventListener('scroll', scheduleSync)
+      window.removeEventListener('resize', scheduleSync)
+      window.removeEventListener('hashchange', syncFromLocation)
+      window.removeEventListener('popstate', syncFromLocation)
+      if (animationFrame) window.cancelAnimationFrame(animationFrame)
+    }
+  }, [])
+
+  // 平板与手机使用横向菜单；激活项改变时只移动导航自身，不改变正文纵向位置。
+  useEffect(() => {
+    activeSectionRef.current = activeSection
+    if (!window.matchMedia('(max-width: 840px)').matches) return
+    const navigation = document.querySelector<HTMLElement>('.sidebar nav')
+    const link = navigation?.querySelector<HTMLElement>(`a[href="#${activeSection}"]`)
+    if (!navigation || !link) return
+    const left = Math.max(0, link.offsetLeft - (navigation.clientWidth - link.clientWidth) / 2)
+    navigation.scrollTo({
+      left,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+    })
+  }, [activeSection])
+
+  const selectNavigationSection = (section: NavigationSectionID) => {
+    navigationLockUntilRef.current = performance.now() + 900
+    activeSectionRef.current = section
+    setActiveSection(section)
+  }
 
   const selectedRun = runDetail?.id === selectedRunID
     ? runDetail
@@ -823,11 +969,11 @@ export function App() {
         <aside className="sidebar">
           <div className="brand"><div className="brand-mark"><Sparkles size={18} /></div><div><strong>SWARM<span>/OS</span></strong><small>AI 任务指挥中心</small></div></div>
           <nav aria-label="主导航">
-            <a className="active" href="#overview"><CircleGauge size={18} /><span>Run 总览</span></a>
-            <a href="#dag"><Workflow size={18} /><span>任务编排</span><em>{activeTasks}</em></a>
-            <a href="#timeline"><Activity size={18} /><span>执行时间线</span></a>
-            <a href="#artifacts"><FileBox size={18} /><span>交付物</span></a>
-            <a href="#inbox"><Inbox size={18} /><span>审批与输入</span>{interactions.length > 0 && <em className="warning">{interactions.length}</em>}</a>
+            <a className={activeSection === 'overview' ? 'active' : ''} aria-current={activeSection === 'overview' ? 'location' : undefined} href="#overview" onClick={() => selectNavigationSection('overview')}><CircleGauge size={18} /><span>Run 总览</span></a>
+            <a className={activeSection === 'dag' ? 'active' : ''} aria-current={activeSection === 'dag' ? 'location' : undefined} href="#dag" onClick={() => selectNavigationSection('dag')}><Workflow size={18} /><span>任务编排</span><em>{activeTasks}</em></a>
+            <a className={activeSection === 'timeline' ? 'active' : ''} aria-current={activeSection === 'timeline' ? 'location' : undefined} href="#timeline" onClick={() => selectNavigationSection('timeline')}><Activity size={18} /><span>执行时间线</span></a>
+            <a className={activeSection === 'artifacts' ? 'active' : ''} aria-current={activeSection === 'artifacts' ? 'location' : undefined} href="#artifacts" onClick={() => selectNavigationSection('artifacts')}><FileBox size={18} /><span>交付物</span></a>
+            <a className={activeSection === 'inbox' ? 'active' : ''} aria-current={activeSection === 'inbox' ? 'location' : undefined} href="#inbox" onClick={() => selectNavigationSection('inbox')}><Inbox size={18} /><span>审批与输入</span>{interactions.length > 0 && <em className="warning">{interactions.length}</em>}</a>
           </nav>
           <RunRail runs={runs} selectedID={selectedRunID} query={runQuery} onQuery={setRunQuery} onSelect={setSelectedRunID} />
           <div className="sidebar-infra">
@@ -851,13 +997,13 @@ export function App() {
             </div>
           </header>
 
-          <div className="content" id="overview">
+          <div className="content">
             <div className="aria-status" aria-live="polite">{notice?.text}</div>
             {error && <div className="connection-banner"><XCircle size={17} /><div><strong>部分控制面能力暂不可用</strong><span>{error} · 控制台会自动重试</span></div></div>}
             {notice && <div className={`notice-banner ${notice.tone}`}><div>{notice.tone === 'success' ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}<span>{notice.text}</span></div><button type="button" aria-label="关闭提示" onClick={() => setNotice(undefined)}><X size={15} /></button></div>}
             {selectedRun?.legacy && <div className="compat-banner"><AlertTriangle size={16} /><div><strong>Legacy API 降级模式</strong><span>当前后端尚未提供 Run 动作、Artifact、Scheduler Explain 和 Interaction；现有 Swarm 数据仍可只读查看。</span></div></div>}
 
-            <section className="hero-section">
+            <section className="hero-section" id="overview">
               <div className="hero-orb orb-one" aria-hidden="true" /><div className="hero-orb orb-two" aria-hidden="true" />
               <div className="hero-copy"><span className="eyebrow">运行任务 / {shortID(selectedRunID)}</span><h1>{selectedRun?.name ?? 'SwarmOS AI 任务指挥中心'}</h1><p>{selectedRun?.goal ?? (loading ? '正在连接运行控制面…' : '创建第一个 Run，将长期任务纳入可恢复、可验证的执行链路。')}</p>{selectedRun?.deadlineAt && <small><Clock3 size={13} /> 截止时间 {formatDate(selectedRun.deadlineAt)}</small>}</div>
               <div className="hero-right">
